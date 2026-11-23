@@ -24506,8 +24506,8 @@ const CX_FONT_TABLE = Object.freeze({
       return true;
     }
     if (!useFeedback && pageQuizNoFeedbackRetries >= 1) {
-      log('⚠️ 章节测验：仍未读到逐题对错，已完成过一次 AI 回退重做；为避免反复提交相同答案，停止自动重做。请提供结果页题块 DOM 或人工处理');
-      return true;
+      // 用户明确选择：这种无法读取对错的情况不再卡住，复用现有单次跳节与锁章停止守护。
+      return abandonCurrentPageQuiz('仍无法读取逐题对错，且唯一一次 AI 回退已使用；按设置直接跳过当前测验');
     }
 
     pageQuizRetryAttempt++;
@@ -24524,7 +24524,7 @@ const CX_FONT_TABLE = Object.freeze({
           pageQuizRetryAttempt + ' 次重做）');
       } else {
         log('章节测验：' + result.reason + '，未读到逐题对错；进行唯一一次 AI 回退重做（第 ' +
-          pageQuizRetryAttempt + ' 次），仍失败将停止，避免死循环');
+          pageQuizRetryAttempt + ' 次），仍失败将直接尝试跳节，避免死循环');
       }
     }
     if (!realClick(result.redo)) {

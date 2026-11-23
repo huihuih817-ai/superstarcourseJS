@@ -21361,10 +21361,10 @@ const CX_FONT_TABLE = Object.freeze({
  *          同节有未完成视频时暂停章节测验；必及格测验按逐题对错反馈保留答对题，
  *          错题使用有界候选穷举，多选重做先清旧选项，候选耗尽或结构不明时停止自动提交；
  *          跨同源 frame 扫描逐题反馈，完全无反馈时最多 AI 回退一次，防止无限重做。
- * v1.1 修复：适配 marking_cuo/marking_dui 空图标，从我的答案或 aria-checked 恢复已提交答案；
- *          重复选项字母去重，阻塞日志区分答案未还原、候选耗尽与选项过多；
- *          每份测验最多 7 次实际提交并跨刷新保存，达到上限后冻结 AI/重做且只尝试一次跳节；
- *          目录 8 秒不变按锁章总停止，结果 90 秒不明确退出，手动/末章/锁章停止均阻断后续 AI。
+ * v1.1：每份测验只自动作答并提交一次，未通过后进入单次跳节流程；
+ *          识别“未达到及格线，是否重新提交”，先点取消/否/关闭再尝试一次跳节；
+ *          弹窗跨章节残留时冻结当前页面，目录 8 秒不变或弹窗不消失则总停止；
+ *          成绩完成标记延迟时保持等待，手动/末章/锁章停止均阻断后续 AI。
  * 手动测试：nextSection() 强制跳下一节；
  *          muteAll() 立刻静音，unmuteAll() 恢复声音并关闭自动静音；
  *          cxProbe() 打印诊断信息；quizDebug() 打印弹题的真实 DOM；
@@ -22947,7 +22947,7 @@ const CX_FONT_TABLE = Object.freeze({
     var id = objectId || pageUrl || signal.url;
     videoStatusLogOnce('status:' + signal.sectionId + '|' + id + '|' + signal.finished,
       signal.finished
-        ? '视频状态：播放器接口明确返回完成（' + signal.field + '）；即使任务标签滞后，也不再重新播放'
+        ? '视频状态：播放器接口明确返回完成（' + signal.field + '）；任务标签滞后时仍保持完成状态'
         : '视频状态诊断：播放器接口返回未完成（' + signal.field + '），不按整分钟续播点误判完成');
 
     // 跨域播放器把明确状态交给顶层；顶层仍会检查同节其他任务点。
@@ -24272,9 +24272,9 @@ const CX_FONT_TABLE = Object.freeze({
   var pageQuizNoFeedbackRetries = 0;                      // 无逐题反馈时最多 AI 重答一次，防死循环
   var completedPageQuizState = { key: '', at: 0 };
 
-  // ---------------- 测验硬上限与退出守护（v1.1） ----------------
-  // 只按真实提交次数计数并跨刷新保存；任何情况下都不会进入第 8 次自动提交。
-  var MAX_PAGE_QUIZ_SUBMISSIONS = 7;
+  // ---------------- 单次作答与退出守护（v1.1） ----------------
+  // 每份测验只自动提交一次；未通过就关闭失败弹窗并尝试跳节，不再穷举或 AI 重做。
+  var MAX_PAGE_QUIZ_SUBMISSIONS = 1;
   var PAGE_QUIZ_GUARD_STORAGE = 'autoStudy:quizGuard:v1.1';
   var pageQuizGuard = { sig: '', section: '', count: 0, noFeedback: 0, abandoned: false };
   var pageQuizEscape = null;
@@ -24371,7 +24371,19 @@ const CX_FONT_TABLE = Object.freeze({
     if (!pageQuizEscape) return false;
     var active = currentActiveId();
     if (active && active !== pageQuizEscape.from) {
-      log('章节测验退出守护：目录已进入下一节，恢复新任务的正常处理；旧测验不会被继续作答');
+      // 目录变了但旧失败弹窗仍在时，不能恢复新章节的答题/跳节，否则会连续误跳。
+      var docs = allDocs(), lingeringModal = false;
+      for (var d = 0; d < docs.length; d++) {
+        if (findRequiredQuizFailureModal(docs[d])) { lingeringModal = true; break; }
+      }
+      if (lingeringModal) {
+        if (Date.now() - pageQuizEscape.since >= 8000) {
+          pageQuizEscape = null;
+          return stopForQuizGuard('不及格弹窗在跳节后仍然可见，已停止，避免连续跳过后续章节');
+        }
+        return true;
+      }
+      log('章节测验：已进入下一节，弹窗状态正常，继续处理当前任务');
       pageQuizEscape = null;
       pageQuizState.sig = '';
       pageQuizState.done = false;
@@ -24391,7 +24403,7 @@ const CX_FONT_TABLE = Object.freeze({
   }
 
   function isQuizRedoText(text) {
-    return /^(?:重做|重新作答|重新答题|再试一次)(?:\s*[（(]\s*剩余\s*\d+\s*次\s*[）)])?$/.test(String(text || '').trim());
+    return /^(?:重做|重新作答|重新答题|重新提交|再试一次)(?:\s*[（(]\s*剩余\s*\d+\s*次\s*[）)])?$/.test(String(text || '').trim());
   }
 
   function findQuizRedoButton(root) {
@@ -24406,8 +24418,7 @@ const CX_FONT_TABLE = Object.freeze({
     return null;
   }
 
-  // 已提交后的失败浮层本身就是结果证据，不要求页面另有独立“重做”按钮。
-  // 仍然必须同时满足可见浮层、失败文字、重做提示和真实确认按钮，避免误判静态规则说明。
+  // 同时识别“是否重新提交”。跳节前只使用取消/否/关闭，绝不点确认重做。
   function findRequiredQuizFailureModal(root) {
     var nodes;
     try { nodes = root.querySelectorAll('div,section,article'); } catch (e) { return null; }
@@ -24417,13 +24428,17 @@ const CX_FONT_TABLE = Object.freeze({
       var text = tightText(el);
       if (!text || text.length > 120) continue;
       var failed = /不及格|未及格|没有及格|未能及格|不合格|未通过|未达到\s*(?:及格|通过)|未满足\s*(?:及格|通过)/.test(text);
-      var retry = /重做|重新作答|重新答题|再试一次/.test(text);
+      var retry = /重做|重新作答|重新答题|重新提交|再试一次/.test(text);
       if (!failed || !retry) continue;
-      var confirm = findByText(el, ['重新作答', '重新答题', '重做', '再试一次', '确定', '我知道了']);
-      // 只有“取消”或没有可点确认按钮时不构造重做结果，更不能据此跳节。
-      if (!confirm || isDisabled(confirm)) continue;
+      var confirm = findByText(el, ['重新提交', '重新作答', '重新答题', '重做', '再试一次', '确定', '我知道了']);
+      var cancel = findByText(el, ['取消', '否', '关闭', '返回', '继续作答']);
+      if (!cancel) {
+        try { cancel = el.querySelector('.el-dialog__close,.el-message-box__close,.close,[aria-label="Close"]'); } catch (e) {}
+      }
       return {
         doc: el.ownerDocument || root.ownerDocument || root,
+        overlay: el,
+        cancel: cancel,
         redo: confirm,
         key: 'modal:' + text.slice(0, 200),
         reason: '平台弹窗提示未达到及格要求',
@@ -24460,78 +24475,34 @@ const CX_FONT_TABLE = Object.freeze({
   }
 
   function handleRequiredPageQuizRetry(result, roots) {
+    // 同一失败结果只处理一次；不再生成候选、请求 AI 或点击“重新提交”。
+    if (pageQuizState.retryHandled && pageQuizState.retryKey === result.key) return true;
     pageQuizState.needAdvance = false;
     pageQuizState.active = false;
     pageQuizState.submitted = false;
     pageQuizState.done = true;
     pageQuizState.doc = result.doc;
-    completedPageQuizState.key = '';
-    completedPageQuizState.at = 0;
-
-    // 点击后旧结果 DOM 可能还停留几秒，同一结果不能反复生成候选或点击。
-    if (pageQuizState.retryHandled && pageQuizState.retryKey === result.key) return true;
-    var retryPlan = null, retryQuestions = [];
-    // 失败弹窗常在顶层 document，题目却在同源 iframe；必须扫描本轮全部根节点。
-    var retryRoots = roots && roots.length ? roots : [result.doc];
-    try { retryQuestions = parsePageQuestions(retryRoots); } catch (e) {}
-    syncPageQuizGuard(makePageQuizSignature(retryQuestions));
-    if (pageQuizGuard.abandoned || pageQuizGuard.count >= MAX_PAGE_QUIZ_SUBMISSIONS) {
-      return abandonCurrentPageQuiz('已经达到 ' + MAX_PAGE_QUIZ_SUBMISSIONS + ' 次实际提交，仍未通过');
-    }
-    try { retryPlan = buildPageQuizRetryPlan(retryQuestions); } catch (e) {}
-    var useFeedback = !!(retryPlan && retryPlan.found > 0);
-
-    clearPlatformCompletionWait('quiz');
-    pageQuizState.waitingCompletion = false;
     pageQuizState.retryHandled = true;
     pageQuizState.retryKey = result.key;
-    pageQuizState.applied = {};
-    pageQuizState.appliedAt = {};
     pageQuizState.pending = {};
-    pageQuizState.fails = {};
-    pageQuizState.selectFails = {};
-    pageQuizState.warnedSelect = false;
-    pageQuizState.warnedSelect2 = false;
-    // 有逐题反馈时保留答对答案并给错题换候选；否则只允许一次 AI 重新作答。
-    pageQuizCache = useFeedback ? retryPlan.cache : {};
+    pageQuizState.waitingCompletion = false;
+    completedPageQuizState.key = '';
+    completedPageQuizState.at = 0;
+    clearPlatformCompletionWait('quiz');
 
-    if (!result.redo) {
-      log('⚠️ 章节测验：' + result.reason + '，但没找到可用的确认或“重做”按钮；已停止跳节，请人工处理');
-      return true;
-    }
-    if (useFeedback && (retryPlan.blocked.length || (!retryPlan.changed && !retryPlan.unknown))) {
-      log('⚠️ 章节测验：已读取逐题反馈，但无法安全生成下一轮答案（' +
-        (retryPlan.blockReasons.length ? retryPlan.blockReasons.join('；') : '没有需要更换或重新作答的题目') +
-        '）；已停止自动重做，请人工处理');
-      return true;
-    }
-    if (!useFeedback && pageQuizNoFeedbackRetries >= 1) {
-      // 用户明确选择：这种无法读取对错的情况不再卡住，复用现有单次跳节与锁章停止守护。
-      return abandonCurrentPageQuiz('仍无法读取逐题对错，且唯一一次 AI 回退已使用；按设置直接跳过当前测验');
-    }
+    var retryRoots = roots && roots.length ? roots : [result.doc];
+    var retryQuestions = [];
+    try { retryQuestions = parsePageQuestions(retryRoots); } catch (e) {}
+    syncPageQuizGuard(makePageQuizSignature(retryQuestions));
 
-    pageQuizRetryAttempt++;
-    if (useFeedback) {
-      log('章节测验：反馈式穷举第 ' + pageQuizRetryAttempt + ' 轮，保留 ' + retryPlan.correct +
-        ' 道答对题，为 ' + retryPlan.changed + ' 道错题更换未试答案' +
-        (retryPlan.unknown ? '，另有 ' + retryPlan.unknown + ' 题重新交给 AI' : '') +
-        '；本轮 ' + retryPlan.details.slice(0, 12).join('，'));
-    } else {
-      pageQuizNoFeedbackRetries++;
-      savePageQuizGuard();               // 刷新后也记住唯一一次无反馈 AI 回退已经使用
-      if (result.modal) {
-        log('章节测验：' + result.reason + '，未读到逐题对错；点击失败弹窗确认，进行唯一一次 AI 回退重做（第 ' +
-          pageQuizRetryAttempt + ' 次重做）');
-      } else {
-        log('章节测验：' + result.reason + '，未读到逐题对错；进行唯一一次 AI 回退重做（第 ' +
-          pageQuizRetryAttempt + ' 次），仍失败将直接尝试跳节，避免死循环');
+    if (result.modal) {
+      // 弹窗不关闭就跳节会污染下一章，导致连续误跳；找不到关闭入口时宁可总停止。
+      if (!result.cancel || isDisabled(result.cancel) || !realClick(result.cancel)) {
+        return stopForQuizGuard('不及格弹窗没有找到可用的“取消／否／关闭”按钮，已取消跳节，避免弹窗残留到下一章');
       }
+      log('章节测验：已关闭“未达到及格线，是否重新提交”弹窗（未选择重新提交）');
     }
-    if (!realClick(result.redo)) {
-      log('⚠️ 章节测验：' + (result.modal ? '失败弹窗确认按钮' : '“重做”') +
-        '点击未执行，请手动处理；当前章节不会跳过');
-    }
-    return true;
+    return abandonCurrentPageQuiz('本次作答未通过，单次作答流程结束，准备进入下一节');
   }
 
   // 只有平台完成标记才能放行；分数或“重做”按钮本身都不是完成证据。
@@ -24619,7 +24590,7 @@ const CX_FONT_TABLE = Object.freeze({
     pageQuizRetryAttempt = 0;
     clearPageQuizGuard();                 // 正常通过优先于上限退出，旧次数不能污染以后重做
     log('章节测验：平台已确认任务完成' + (result.score ? '（成绩 ' + result.score + '）' : '') +
-      '，不再作答或点击可选“重做”，进入下一节');
+      '，进入下一节');
     try { afterQuizDone(result.doc); } catch (e) {}
     return true;
   }
@@ -24731,15 +24702,14 @@ const CX_FONT_TABLE = Object.freeze({
     if (completedResult) return advanceCompletedPageQuiz(completedResult);
     var scoredResult = findScoredPageQuiz(roots);
     if (scoredResult) {
-      if (pageQuizGuard.abandoned || pageQuizGuard.count >= MAX_PAGE_QUIZ_SUBMISSIONS) {
-        return abandonCurrentPageQuiz('已经达到 ' + MAX_PAGE_QUIZ_SUBMISSIONS + ' 次实际提交，平台仍未确认完成');
-      }
+      // 已公布成绩只是完成标记延迟，不能因为已经提交过一次就误判为失败并跳节。
+      if (pageQuizGuard.abandoned) return abandonCurrentPageQuiz('当前测验已标记为跳过');
       return waitForScoredPageQuiz(scoredResult);
     }
     if (pageQuizState.waitingCompletion) {
       if (pageQuizState.submittedAt && now - pageQuizState.submittedAt > 90000) {
         if (pageQuizGuard.count >= MAX_PAGE_QUIZ_SUBMISSIONS) {
-          return abandonCurrentPageQuiz('第 7 次提交后等待结果超过 90 秒');
+          return abandonCurrentPageQuiz('本次提交后等待结果超过 90 秒');
         }
         return stopForQuizGuard('章节测验提交结果超过 90 秒仍未确认，已退出等待，避免无限刷新和重试');
       }
@@ -24751,7 +24721,7 @@ const CX_FONT_TABLE = Object.freeze({
       if (now - pageQuizState.submittedAt > 1500) {
         if (now - pageQuizState.submittedAt > 90000) {
           if (pageQuizGuard.count >= MAX_PAGE_QUIZ_SUBMISSIONS) {
-            return abandonCurrentPageQuiz('第 7 次提交后等待结果超过 90 秒');
+            return abandonCurrentPageQuiz('本次提交后等待结果超过 90 秒');
           }
           return stopForQuizGuard('章节测验提交结果超过 90 秒仍未返回，已退出等待，避免无限刷新和重试');
         }
@@ -24946,14 +24916,14 @@ const CX_FONT_TABLE = Object.freeze({
         // 点击前再检查一次，防止等待 AI / 勾选期间已经达到上限。
         syncPageQuizGuard(sig);
         if (pageQuizGuard.abandoned || pageQuizGuard.count >= MAX_PAGE_QUIZ_SUBMISSIONS) {
-          return abandonCurrentPageQuiz('当前测验已达到 ' + MAX_PAGE_QUIZ_SUBMISSIONS + ' 次提交上限，禁止第 8 次提交');
+          return abandonCurrentPageQuiz('当前测验已自动提交过一次，禁止再次自动提交');
         }
         if (realClick(btn)) {
           // 只有点击真正执行才计数；点击异常不会消耗提交额度，也不会伪装成已提交。
           recordPageQuizSubmission();
           pageQuizState.submitted = true;
           pageQuizState.submittedAt = now;
-          pageQuizState.retryHandled = false;   // 新一轮提交后若仍未及格，必须允许再次重做
+          pageQuizState.retryHandled = false;   // 允许处理本轮提交返回的失败结果
           pageQuizState.retryKey = '';
           pageQuizState.waitingCompletion = false;
           pageQuizState.needAdvance = false;

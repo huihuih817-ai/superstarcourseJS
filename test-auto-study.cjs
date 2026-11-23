@@ -5,6 +5,8 @@ const assert = require('assert');
 
 const sourcePath = path.join(__dirname, 'auto-study.user.js');
 let source = fs.readFileSync(sourcePath, 'utf8');
+assert(!source.includes('installVideoStatusProbe(docs[s].defaultView)'), '正式轮询仍在包装播放器网络请求');
+assert(!source.includes('try { diagnoseVideoResume(docs); }'), '正式轮询仍在输出续播延迟诊断');
 // 仅在测试副本中允许替换 MD5，以便用合成路径命中真实指纹表；正式脚本仍冻结字体库。
 const frozenFontLib = 'return Object.freeze({ Typr, md5: scope.md5 });';
 assert(source.includes(frozenFontLib), '找不到字体库测试注入点');
@@ -26,11 +28,27 @@ source = source.replace(marker, `  window.__test = {
     isLastSection: isLastSection,
     pageQuizState: () => pageQuizState,
     pageQuizCache: () => pageQuizCache,
+    pageQuizLearning: () => pageQuizLearning,
+    pageQuizQuestionKey: pageQuizQuestionKey,
+    readPageQuestionFeedback: readPageQuestionFeedback,
+    nextPageQuizCandidate: nextPageQuizCandidate,
+    buildPageQuizRetryPlan: buildPageQuizRetryPlan,
+    handleRequiredPageQuizRetry: handleRequiredPageQuizRetry,
+    parsePageQuestions: parsePageQuestions,
+    makePageQuizSignature: makePageQuizSignature,
+    syncPageQuizGuard: syncPageQuizGuard,
+    recordPageQuizSubmission: recordPageQuizSubmission,
+    abandonCurrentPageQuiz: abandonCurrentPageQuiz,
+    updatePageQuizEscape: updatePageQuizEscape,
+    pageQuizGuard: () => pageQuizGuard,
+    pageQuizEscape: () => pageQuizEscape,
+    pageQuizNoFeedbackRetries: () => pageQuizNoFeedbackRetries,
     parseAnswerLetters: parseAnswerLetters,
     stripLetter: stripLetter,
     pageOptionsOf: pageOptionsOf,
     rowSelected: rowSelected,
     applyPageAnswer: applyPageAnswer,
+    hasUnfinishedVideoTask: hasUnfinishedVideoTask,
     autoAdvance: autoAdvance,
     applyVideoRate: applyVideoRate,
     processVideoStatusPayload: processVideoStatusPayload,
@@ -323,7 +341,7 @@ function makeVideoTaskFixture(ctx, options) {
   video.currentSrc = 'https://example.test/video.mp4';
   video.play = function () { playCalls++; return Promise.resolve(); };
   const marker = makeElement(doc, '任务点已完成');
-  doc.body.textContent = options.direct ? '任务点已完成' : '';
+  doc.body.textContent = options.direct && options.marker !== false ? '任务点已完成' : '';
   doc.querySelector = function (selector) {
     if (selector === '#coursetree .posCatalog_active') return active;
     return null;
@@ -334,7 +352,7 @@ function makeVideoTaskFixture(ctx, options) {
     if (selector === '#prev_tab .prev_ul li, .prev_ul li') return [];
     if (selector === 'video') return options.direct ? [video] : [];
     if (selector === '.ans-job-finished,.ans-jobfinished,div,p,span') {
-      return options.direct ? [marker] : [];
+      return options.direct && options.marker !== false ? [marker] : [];
     }
     return [];
   };
@@ -397,7 +415,12 @@ function makeQuizResultFixture(ctx, options) {
   }
   sync();
 
-  doc.querySelector = selector => selector === '#coursetree .posCatalog_active' ? active : null;
+  doc.querySelector = function (selector) {
+    if (selector !== '#coursetree .posCatalog_active') return null;
+    if ((active.className || '').includes('posCatalog_active')) return active;
+    if ((next.className || '').includes('posCatalog_active')) return next;
+    return null;
+  };
   doc.querySelectorAll = function (selector) {
     if (selector === '#coursetree .posCatalog_select') return [active, next];
     if (selector === '#prev_tab .prev_ul li, .prev_ul li') return [];
@@ -416,6 +439,43 @@ function makeQuizResultFixture(ctx, options) {
     confirmClicks: () => confirmClicks,
     cancelClicks: () => cancelClicks
   };
+}
+
+function makeFeedbackQuestion(ctx, options) {
+  options = options || {};
+  const doc = ctx.document;
+  const type = options.type || 'single';
+  const typeName = type === 'multi' ? '多选题' : (type === 'judge' ? '判断题' : '单选题');
+  const stem = makeElement(doc, options.text || `【${typeName}】逐题反馈穷举测试题干`);
+  const block = makeElement(doc, options.submittedText || stem.textContent);
+  stem.parentElement = block;
+  const opts = [];
+  const rows = [];
+  const count = options.count == null ? 4 : options.count;
+  for (let i = 0; i < count; i++) {
+    const letter = String.fromCharCode(65 + i);
+    const row = makeElement(doc, `${letter}.${options.optionText || '选项' + letter}`);
+    row.parentElement = block;
+    row.className = 'option';
+    const label = makeElement(doc, row.textContent);
+    label.parentElement = row;
+    label.click = function () {
+      row.className = /(^|\s)is-active(?=\s|$)/.test(row.className) ? 'option' : 'option is-active';
+    };
+    row.querySelector = selector => selector === 'label' ? label : null;
+    row.querySelectorAll = () => [];
+    opts.push({ letter, text: `选项${letter}`, el: row, input: null });
+    rows.push(row);
+  }
+  const feedback = (options.feedback || []).map(item => {
+    const data = typeof item === 'string' ? { text: item } : item;
+    const el = makeElement(doc, data.text || '');
+    el.className = data.className || '';
+    el.parentElement = block;
+    return el;
+  });
+  block.querySelectorAll = selector => selector === '*' ? [stem].concat(rows, feedback) : [];
+  return { text: stem.textContent, type, block, stemEl: stem, opts, rows, feedback };
 }
 
 function createSequenceContext(baseConfig, answers, extraConfig) {
@@ -725,7 +785,7 @@ function makeFontQuestionFixture(ctx, mode) {
     '同页还有未完成测验任务时不能跳过整节'
   );
 
-  // 播放器明确完成可以覆盖滞后的任务标签，但其他任务点仍有保护。
+  // 播放器接口只用于诊断，不能替代任务标记；否则平台未记账就会提前跳节。
   const statusSplitCtx = createContext({ userscript: true, config, gmImpl() {} });
   const statusSplit = makeVideoTaskFixture(statusSplitCtx, { completed: false });
   assert.strictEqual(statusSplitCtx.__test.findCompletedVideoTask([statusSplit.doc]), null);
@@ -735,10 +795,13 @@ function makeFontQuestionFixture(ctx, mode) {
     statusSplitCtx.document.defaultView
   );
   assert(splitSignal && splitSignal.finished, 'JSONP 中的 isFinished=true 未识别');
-  const splitResult = statusSplitCtx.__test.findCompletedVideoTask([statusSplit.doc]);
-  assert(splitResult && splitResult.source === 'player', '播放器完成状态没有覆盖滞后标签');
+  assert.strictEqual(
+    statusSplitCtx.__test.findCompletedVideoTask([statusSplit.doc]),
+    null,
+    'isFinished 不能覆盖未完成的任务标签'
+  );
   statusSplitCtx.__test.autoAdvance([statusSplit.doc]);
-  assert.strictEqual(statusSplit.navigations(), 1, '明确完成的视频没有进入下一任务');
+  assert.strictEqual(statusSplit.navigations(), 0, '接口显示完成但平台未记账时不应跳节');
 
   const statusPendingCtx = createContext({ userscript: true, config, gmImpl() {} });
   const statusPending = makeVideoTaskFixture(statusPendingCtx, { pendingWork: true });
@@ -781,16 +844,28 @@ function makeFontQuestionFixture(ctx, mode) {
   assert.strictEqual(conflictStatusCtx.__test.findCompletedVideoTask([conflictStatus.doc]), null, '冲突完成字段不能猜');
 
   const directStatusCtx = createContext({ userscript: true, config, gmImpl() {} });
-  const directStatus = makeVideoTaskFixture(directStatusCtx, { direct: true });
-  directStatus.doc.body.textContent = '';
+  const directStatus = makeVideoTaskFixture(directStatusCtx, { direct: true, marker: false });
   directStatusCtx.__test.processVideoStatusPayload(
     'https://example.test/multimedia/log/a/direct1', '{"isPassed":true}', directStatusCtx.document.defaultView
   );
-  const directStatusResult = directStatusCtx.__test.findCompletedVideoTask([directStatus.doc]);
-  assert(directStatusResult && directStatusResult.source === 'player', '同文档播放器完成状态未识别');
+  assert.strictEqual(
+    directStatusCtx.__test.findCompletedVideoTask([directStatus.doc]),
+    null,
+    '同文档播放器状态也不能替代任务完成标记'
+  );
   directStatusCtx.__test.autoAdvance([directStatus.doc]);
-  assert.strictEqual(directStatus.navigations(), 1);
-  assert.strictEqual(directStatus.playCalls(), 0, '明确完成的同文档视频不应重播');
+  assert.strictEqual(directStatus.navigations(), 0);
+
+  // 视频播完但任务标记未出现时，只等待，不能按 98.5% 或 ended 直接跳节。
+  const endedNoMarkerCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const endedNoMarker = makeVideoTaskFixture(endedNoMarkerCtx, { direct: true, marker: false });
+  const endedVideo = endedNoMarker.doc.querySelectorAll('video')[0];
+  endedVideo.duration = 100;
+  endedVideo.currentTime = 100;
+  endedVideo.ended = true;
+  endedVideo.paused = true;
+  endedNoMarkerCtx.__test.autoAdvance([endedNoMarker.doc]);
+  assert.strictEqual(endedNoMarker.navigations(), 0, '视频 ended 但平台未标记完成时提前跳节');
 
   // 状态探针只增加监听：XHR 原调用和 fetch 原响应必须原样保留。
   const probeCtx = createContext({ userscript: true, config, gmImpl() {} });
@@ -957,7 +1032,8 @@ function makeFontQuestionFixture(ctx, mode) {
   secondRetryState.retryHandled = false;
   secondRetryState.retryKey = '';
   retryCtx.__test.handlePageQuiz([retryPage.doc]);
-  assert.strictEqual(retryPage.redoClicks(), 2, '第二次仍未及格时不应停止重做');
+  assert.strictEqual(retryPage.redoClicks(), 1, '没有逐题反馈时第二次失败必须停止，不能无限 AI 重做');
+  assert.strictEqual(retryCtx.__test.pageQuizNoFeedbackRetries(), 1);
   assert.strictEqual(retryPage.navigations(), 0);
 
   // 已有成绩但任务完成标记延迟：等待 -> 仅刷新一次 -> 标记出现后跳节，不点可选重做。
@@ -1000,6 +1076,329 @@ function makeFontQuestionFixture(ctx, mode) {
   pendingResult.complete();
   pendingResultCtx.__test.handlePageQuiz([pendingResult.doc]);
   assert.strictEqual(pendingResult.navigations(), 1, '无分数但平台确认完成后没有放行');
+
+  // 同节顺序锁：视频未完成时不能先进入章节测验，视频完成后才允许作答。
+  assert(source.includes('if (!quizOn && !pendingVideoTask)'), '正式轮询没有启用视频优先顺序锁');
+  assert(source.includes('var key = pageQuizQuestionKey(q);'), '作答流程没有使用归一化题干缓存键');
+  assert(source.includes('pageQuizCache[pageQuizQuestionKey(qq)] = ans'), 'AI 异步答案没有写回归一化缓存键');
+  assert.strictEqual(unfinishedVideoCtx.__test.hasUnfinishedVideoTask([unfinishedVideo.doc], null), true);
+  assert.strictEqual(watchedCtx.__test.hasUnfinishedVideoTask([watchedVideo.doc],
+    watchedCtx.__test.findCompletedVideoTask([watchedVideo.doc])), false);
+  assert.strictEqual(endedNoMarkerCtx.__test.hasUnfinishedVideoTask([endedNoMarker.doc], null), true,
+    '直接视频播完但没有完成标记时不应先答题');
+  assert.strictEqual(directCtx.__test.hasUnfinishedVideoTask([directVideo.doc],
+    directCtx.__test.findCompletedVideoTask([directVideo.doc])), false,
+    '直接视频有平台完成标记后仍被顺序锁拦住');
+
+  // 只读取明确的逐题结果，选项里的“正确/错误”及冲突标记都不能当反馈。
+  const feedbackCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const wrongQuestion = makeFeedbackQuestion(feedbackCtx, { feedback: ['回答错误'] });
+  const correctQuestion = makeFeedbackQuestion(feedbackCtx, {
+    text: '【单选题】另一道反馈测试题干', feedback: ['回答正确']
+  });
+  const optionWordsQuestion = makeFeedbackQuestion(feedbackCtx, {
+    text: '【单选题】选项文字不是结果', optionText: '正确'
+  });
+  const conflictQuestion = makeFeedbackQuestion(feedbackCtx, {
+    text: '【单选题】冲突结果测试题干', feedback: ['回答错误', '回答正确']
+  });
+  assert.strictEqual(feedbackCtx.__test.readPageQuestionFeedback(wrongQuestion), 'wrong');
+  assert.strictEqual(feedbackCtx.__test.readPageQuestionFeedback(correctQuestion), 'correct');
+  assert.strictEqual(feedbackCtx.__test.readPageQuestionFeedback(optionWordsQuestion), null,
+    '选项“A.正确”被误判成逐题反馈');
+  assert.strictEqual(feedbackCtx.__test.readPageQuestionFeedback(conflictQuestion), null,
+    '同时出现对错标记时不应猜测');
+  const normalizedQuestion = makeFeedbackQuestion(feedbackCtx, {
+    text: '【单选题】逐题反馈穷举测试题干回答正确本题得分：2分'
+  });
+  assert.strictEqual(feedbackCtx.__test.pageQuizQuestionKey(normalizedQuestion),
+    feedbackCtx.__test.pageQuizQuestionKey(wrongQuestion), '结果文字导致题干缓存键变化');
+
+  // 用户提供的真实结构：空 span.marking_cuo，答案在另一个“我的答案：ACD”节点。
+  const iconWrong = makeFeedbackQuestion(feedbackCtx, {
+    text: '【多选题】真实空图标错误标记', type: 'multi',
+    feedback: [{ text: '', className: 'marking_cuo' }], submittedText: '我的答案：ACD'
+  });
+  assert.strictEqual(feedbackCtx.__test.readPageQuestionFeedback(iconWrong), 'wrong',
+    '空 span.marking_cuo 没有识别为错题');
+  const iconWrongPlan = feedbackCtx.__test.buildPageQuizRetryPlan([iconWrong]);
+  const iconWrongKey = feedbackCtx.__test.pageQuizQuestionKey(iconWrong);
+  assert.deepStrictEqual(Array.from(iconWrongPlan.cache[iconWrongKey] || []), ['A'],
+    '没有从“我的答案：ACD”记录已试答案并生成下一个候选');
+  const iconCorrect = makeFeedbackQuestion(feedbackCtx, {
+    text: '【单选题】真实空图标正确标记', feedback: [{ text: '', className: 'marking_dui' }],
+    submittedText: '我的答案：B'
+  });
+  assert.strictEqual(feedbackCtx.__test.readPageQuestionFeedback(iconCorrect), 'correct',
+    '空 span.marking_dui 没有识别为答对题');
+  const iconCorrectPlan = feedbackCtx.__test.buildPageQuizRetryPlan([iconCorrect]);
+  assert.deepStrictEqual(Array.from(iconCorrectPlan.cache[feedbackCtx.__test.pageQuizQuestionKey(iconCorrect)] || []), ['B'],
+    '答对图标对应的“我的答案：B”没有保留');
+
+  // “我的答案”在题块外时，从 aria-checked 恢复；重复选项节点不能把四选项算成八选项。
+  const ariaCorrect = makeFeedbackQuestion(feedbackCtx, {
+    text: '【多选题】从选项状态恢复答对答案', type: 'multi',
+    feedback: [{ text: '', className: 'marking_dui' }], submittedText: '结果区无答案文字'
+  });
+  for (const index of [0, 1]) {
+    ariaCorrect.rows[index].getAttribute = name => name === 'aria-checked' ? 'true' : null;
+  }
+  const ariaCorrectPlan = feedbackCtx.__test.buildPageQuizRetryPlan([ariaCorrect]);
+  assert.deepStrictEqual(Array.from(ariaCorrectPlan.cache[feedbackCtx.__test.pageQuizQuestionKey(ariaCorrect)] || []), ['A', 'B'],
+    'aria-checked 中的答对答案 AB 没有恢复');
+  const duplicateOptions = makeFeedbackQuestion(feedbackCtx, {
+    text: '【多选题】重复选项节点去重', type: 'multi',
+    feedback: [{ text: '', className: 'marking_cuo' }], submittedText: '结果区无答案文字'
+  });
+  duplicateOptions.opts = duplicateOptions.opts.concat(duplicateOptions.opts.map(opt => ({
+    letter: opt.letter, text: opt.text, el: opt.el, input: null
+  })));
+  for (const row of duplicateOptions.rows) row.getAttribute = name => name === 'aria-checked' ? 'true' : null;
+  const duplicatePlan = feedbackCtx.__test.buildPageQuizRetryPlan([duplicateOptions]);
+  assert.deepStrictEqual(Array.from(duplicatePlan.cache[feedbackCtx.__test.pageQuizQuestionKey(duplicateOptions)] || []), ['A'],
+    '重复选项节点被算成八项，导致四选项候选无法生成');
+
+  // 单选/判断逐选项尝试；答对题的答案跨重做保留，候选耗尽后阻止继续交卷。
+  const enumCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const single = makeFeedbackQuestion(enumCtx, {
+    feedback: ['回答错误'], submittedText: '你的答案：A'
+  });
+  const singleKey = enumCtx.__test.pageQuizQuestionKey(single);
+  enumCtx.__test.pageQuizCache()[singleKey] = ['A'];
+  for (const expected of ['B', 'C', 'D']) {
+    const plan = enumCtx.__test.buildPageQuizRetryPlan([single]);
+    assert.deepStrictEqual(Array.from(plan.cache[singleKey] || []), [expected],
+      `单选错题没有切换到候选 ${expected}`);
+    enumCtx.__test.pageQuizCache()[singleKey] = [expected];
+  }
+  const exhaustedSingle = enumCtx.__test.buildPageQuizRetryPlan([single]);
+  assert.deepStrictEqual(Array.from(exhaustedSingle.blocked), [1], '单选候选耗尽后没有停止');
+  assert.strictEqual(exhaustedSingle.cache[singleKey], undefined, '候选耗尽后仍复用旧答案');
+
+  const retained = makeFeedbackQuestion(enumCtx, {
+    text: '【单选题】必须保留的答对题', feedback: ['回答正确'], submittedText: '你的答案：B'
+  });
+  const retainedKey = enumCtx.__test.pageQuizQuestionKey(retained);
+  enumCtx.__test.pageQuizCache()[retainedKey] = ['B'];
+  const retainedPlan = enumCtx.__test.buildPageQuizRetryPlan([retained]);
+  assert.deepStrictEqual(Array.from(retainedPlan.cache[retainedKey]), ['B'], '答对题答案没有保留');
+  const retainedUnknown = makeFeedbackQuestion(enumCtx, { text: '【单选题】必须保留的答对题' });
+  const unknownPlan = enumCtx.__test.buildPageQuizRetryPlan([retainedUnknown]);
+  assert.deepStrictEqual(Array.from(unknownPlan.cache[retainedKey]), ['B'],
+    '下一轮读不到反馈时丢失已知答对答案');
+
+  // 多选按单项、两项、三项……枚举；四选项共 15 个非空组合，超过 6 项不穷举。
+  const multi = makeFeedbackQuestion(enumCtx, {
+    text: '【多选题】组合顺序测试题干', type: 'multi', feedback: ['回答错误'], submittedText: '你的答案：A'
+  });
+  const multiKey = enumCtx.__test.pageQuizQuestionKey(multi);
+  enumCtx.__test.pageQuizCache()[multiKey] = ['A'];
+  for (const expected of ['B', 'C', 'D', 'AB']) {
+    const plan = enumCtx.__test.buildPageQuizRetryPlan([multi]);
+    assert.deepStrictEqual(Array.from(plan.cache[multiKey] || []), expected.split(''),
+      `多选候选顺序错误，应为 ${expected}`);
+    enumCtx.__test.pageQuizCache()[multiKey] = expected.split('');
+  }
+  const allMulti = makeFeedbackQuestion(enumCtx, {
+    text: '【多选题】全部组合耗尽测试题干', type: 'multi', feedback: ['回答错误'], submittedText: '你的答案：A'
+  });
+  const allMultiKey = enumCtx.__test.pageQuizQuestionKey(allMulti);
+  enumCtx.__test.pageQuizCache()[allMultiKey] = ['A'];
+  const expectedCombinations = [];
+  for (let size = 1; size <= 4; size++) {
+    for (let mask = 1; mask < 16; mask++) {
+      let bits = 0;
+      for (let bit = 0; bit < 4; bit++) if (mask & (1 << bit)) bits++;
+      if (bits !== size) continue;
+      let answer = '';
+      for (let bit = 0; bit < 4; bit++) if (mask & (1 << bit)) answer += String.fromCharCode(65 + bit);
+      expectedCombinations.push(answer);
+    }
+  }
+  assert.strictEqual(expectedCombinations.length, 15);
+  for (const expected of expectedCombinations.slice(1)) {
+    const plan = enumCtx.__test.buildPageQuizRetryPlan([allMulti]);
+    assert.deepStrictEqual(Array.from(plan.cache[allMultiKey] || []), expected.split(''),
+      `四选项组合没有覆盖 ${expected}`);
+    enumCtx.__test.pageQuizCache()[allMultiKey] = expected.split('');
+  }
+  const exhaustedMulti = enumCtx.__test.buildPageQuizRetryPlan([allMulti]);
+  assert.deepStrictEqual(Array.from(exhaustedMulti.blocked), [1], '15 个多选组合耗尽后没有停止');
+  const sevenOptions = makeFeedbackQuestion(enumCtx, {
+    text: '【多选题】过多选项测试题干', type: 'multi', count: 7
+  });
+  assert.deepStrictEqual(Array.from(enumCtx.__test.nextPageQuizCandidate(sevenOptions, { tried: {} })), [],
+    '七选项多选题不应进行无界穷举');
+
+  // 重做会保留旧勾选：应用新多选前必须先清空，不能把 A+B 叠加成新的错误答案。
+  const clearMulti = makeFeedbackQuestion(enumCtx, { text: '【多选题】清旧选项测试', type: 'multi' });
+  clearMulti.rows[0].className = 'option is-active';
+  enumCtx.__test.applyPageAnswer(clearMulti, ['B']);
+  assert.strictEqual(enumCtx.__test.rowSelected(clearMulti.rows[0]), false, '旧选 A 没有清除');
+  assert.strictEqual(enumCtx.__test.rowSelected(clearMulti.rows[1]), true, '新选 B 没有应用');
+  assert.strictEqual(enumCtx.__test.rowSelected(clearMulti.rows[2]), false, '未选 C 被误勾选');
+  enumCtx.__test.applyPageAnswer(clearMulti, ['C', 'D']);
+  assert.strictEqual(enumCtx.__test.rowSelected(clearMulti.rows[1]), false, '切换到 CD 时旧选 B 没有清除');
+  assert.strictEqual(enumCtx.__test.rowSelected(clearMulti.rows[2]), true);
+  assert.strictEqual(enumCtx.__test.rowSelected(clearMulti.rows[3]), true);
+
+  // 真实循环根因：失败弹窗在顶层，逐题反馈在同源 iframe，不能只扫描弹窗文档。
+  const crossModalCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const crossQuestionCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const crossQuestion = makeFeedbackQuestion(crossQuestionCtx, {
+    text: '【单选题】跨框架逐题反馈测试题干', feedback: ['回答错误'], submittedText: '你的答案：A'
+  });
+  crossQuestion.block.children = [crossQuestion.stemEl];
+  crossQuestionCtx.document.body.textContent = crossQuestion.text;
+  crossQuestionCtx.document.querySelectorAll = function (selector) {
+    if (selector === '*') return [crossQuestion.block, crossQuestion.stemEl]
+      .concat(crossQuestion.rows, crossQuestion.feedback);
+    return [];
+  };
+  const crossParsed = crossModalCtx.__test.parsePageQuestions([crossQuestionCtx.document]);
+  assert.strictEqual(crossParsed.length, 1, '跨框架测试题没有被整页解析器识别');
+  assert.strictEqual(crossModalCtx.__test.readPageQuestionFeedback(crossParsed[0]), 'wrong');
+  const crossKey = crossModalCtx.__test.pageQuizQuestionKey(crossParsed[0]);
+  crossModalCtx.__test.pageQuizCache()[crossKey] = ['A'];
+  let crossRedoClicks = 0;
+  const crossRedo = makeElement(crossModalCtx.document, '确定');
+  crossRedo.click = function () { crossRedoClicks++; };
+  crossModalCtx.__test.handleRequiredPageQuizRetry({
+    doc: crossModalCtx.document, redo: crossRedo, key: 'cross-frame-modal', reason: '未达到及格要求', modal: true
+  }, [crossModalCtx.document, crossQuestionCtx.document]);
+  assert.strictEqual(crossRedoClicks, 1);
+  assert.deepStrictEqual(Array.from(crossModalCtx.__test.pageQuizCache()[crossKey] || []), ['B'],
+    '弹窗与题目分离时清空候选并退回 AI，没有生成 B');
+  assert.strictEqual(crossModalCtx.__test.pageQuizNoFeedbackRetries(), 0,
+    '成功读取逐题反馈时不应消耗无反馈重试额度');
+
+  // 完全读不到逐题反馈时最多 AI 回退一次；第二次失败必须停，不能反复提交同一答案。
+  const loopGuardCtx = createContext({ userscript: true, config, gmImpl() {} });
+  let loopGuardClicks = 0;
+  const loopGuardRedo = makeElement(loopGuardCtx.document, '确定');
+  loopGuardRedo.click = function () { loopGuardClicks++; };
+  function fireNoFeedbackFailure() {
+    const state = loopGuardCtx.__test.pageQuizState();
+    state.retryHandled = false;
+    state.retryKey = '';
+    loopGuardCtx.__test.handleRequiredPageQuizRetry({
+      doc: loopGuardCtx.document, redo: loopGuardRedo, key: 'same-overall-failure',
+      reason: '未达到及格要求', modal: true
+    }, [loopGuardCtx.document]);
+  }
+  fireNoFeedbackFailure();
+  assert.strictEqual(loopGuardClicks, 1, '第一次无反馈失败没有执行唯一一次回退');
+  assert.strictEqual(loopGuardCtx.__test.pageQuizNoFeedbackRetries(), 1);
+  fireNoFeedbackFailure();
+  fireNoFeedbackFailure();
+  assert.strictEqual(loopGuardClicks, 1, '无逐题反馈时陷入无限 AI 重做');
+  assert.strictEqual(loopGuardCtx.__test.pageQuizNoFeedbackRetries(), 1,
+    '被阻止的重试不应继续增加计数');
+
+  // 七次实际提交硬上限：第 6 次之后只能记录到第 7 次，并从本地存储恢复。
+  const capCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const capPage = makeQuizResultFixture(capCtx, { failed: true, completed: false, score: null });
+  const capQuestion = makeFeedbackQuestion(capCtx, { text: '【单选题】七次提交上限测试题干' });
+  const capSig = capCtx.__test.makePageQuizSignature([capQuestion]);
+  capCtx.__test.syncPageQuizGuard(capSig);
+  for (let i = 0; i < 6; i++) capCtx.__test.recordPageQuizSubmission();
+  assert.strictEqual(capCtx.__test.pageQuizGuard().count, 6);
+  capCtx.__test.recordPageQuizSubmission();
+  capCtx.__test.recordPageQuizSubmission();
+  assert.strictEqual(capCtx.__test.pageQuizGuard().count, 7, '提交次数没有封顶在 7');
+  const savedCap = JSON.parse(capCtx.localStorage.getItem('autoStudy:quizGuard:v1.1'));
+  assert.strictEqual(savedCap.count, 7, '第 7 次提交没有写入本地存储');
+  capCtx.__test.pageQuizGuard().sig = '';       // 模拟刷新后的空内存状态
+  capCtx.__test.syncPageQuizGuard(capSig);
+  assert.strictEqual(capCtx.__test.pageQuizGuard().count, 7, '刷新后没有恢复提交次数');
+
+  // 达到上限后只尝试一次下一节；目录变化后恢复新任务，不能全局关掉 AI。
+  capCtx.__test.abandonCurrentPageQuiz('测试七次上限');
+  capCtx.__test.abandonCurrentPageQuiz('重复退出不应重复跳节');
+  assert.strictEqual(capPage.navigations(), 1, '达到上限后重复点击了下一节');
+  assert(capCtx.__test.pageQuizEscape(), '没有记录跳节来源');
+  assert(capCtx.__autoStudyTimer, '等待目录变化时过早停止了整个脚本');
+  const capActive = capPage.doc.querySelectorAll('#coursetree .posCatalog_select')[0];
+  const capNext = capPage.doc.querySelectorAll('#coursetree .posCatalog_select')[1];
+  capActive.className = 'posCatalog_select';
+  capNext.className = 'posCatalog_select posCatalog_active';
+  assert.strictEqual(capCtx.__test.updatePageQuizEscape(), false, '目录已变化却仍冻结后续任务');
+  assert.strictEqual(capCtx.__test.pageQuizEscape(), null);
+  assert.strictEqual(capCtx.__test.AI.enabled, true, '成功跳到新小节后错误关闭了 AI');
+  capCtx.__test.syncPageQuizGuard(capSig);
+  assert.strictEqual(capCtx.__test.pageQuizGuard().abandoned, false, '新小节仍继承旧测验放弃状态');
+  assert.strictEqual(capCtx.__test.pageQuizGuard().count, 0, '新小节仍继承旧提交次数');
+
+  // 第七次如果实际通过，完成标记优先，清除旧次数而不是进入放弃流程。
+  const seventhPassCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const seventhPassPage = makeQuizResultFixture(seventhPassCtx, { score: 100, completed: true });
+  const seventhPassQuestion = makeFeedbackQuestion(seventhPassCtx, { text: '【单选题】第七次正常通过测试题干' });
+  seventhPassCtx.__test.syncPageQuizGuard(seventhPassCtx.__test.makePageQuizSignature([seventhPassQuestion]));
+  for (let i = 0; i < 7; i++) seventhPassCtx.__test.recordPageQuizSubmission();
+  seventhPassCtx.__test.handlePageQuiz([seventhPassPage.doc]);
+  assert.strictEqual(seventhPassCtx.__test.pageQuizGuard().count, 0, '正常完成后没有清除提交守护');
+  assert.strictEqual(seventhPassCtx.__test.pageQuizGuard().abandoned, false, '第七次通过被误判为放弃');
+  assert.strictEqual(seventhPassCtx.__test.AI.enabled, true, '正常完成错误关闭了后续 AI');
+
+  // 平台锁章：8 秒目录不变就总停止，整段时间只允许一次跳节点击。
+  const lockedCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const lockedPage = makeQuizResultFixture(lockedCtx, { failed: true, completed: false, score: null });
+  const lockedQuestion = makeFeedbackQuestion(lockedCtx, { text: '【单选题】平台锁章退出测试题干' });
+  lockedCtx.__test.syncPageQuizGuard(lockedCtx.__test.makePageQuizSignature([lockedQuestion]));
+  for (let i = 0; i < 7; i++) lockedCtx.__test.recordPageQuizSubmission();
+  lockedCtx.__test.abandonCurrentPageQuiz('测试锁章');
+  assert.strictEqual(lockedCtx.__test.updatePageQuizEscape(), true);
+  lockedCtx.__test.abandonCurrentPageQuiz('锁章期间不得再次跳节');
+  assert.strictEqual(lockedPage.navigations(), 1, '锁章等待期间重复尝试跳节');
+  lockedCtx.__test.pageQuizEscape().since -= 8001;
+  assert.strictEqual(lockedCtx.__test.updatePageQuizEscape(), true);
+  assert.strictEqual(lockedCtx.__autoStudyTimer, null, '锁章 8 秒后没有停止定时器');
+  assert.strictEqual(lockedCtx.__test.AI.enabled, false, '锁章停止后仍可发起 AI 请求');
+  assert.strictEqual(lockedPage.navigations(), 1, '锁章停止前后发生了多次跳节');
+
+  // 最后一节达到上限直接停止，不能伪造完成或调用下一节。
+  const cappedLastCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const cappedLastPage = makeQuizResultFixture(cappedLastCtx, { failed: true, completed: false, score: null });
+  const cappedLastActive = cappedLastPage.doc.querySelector('#coursetree .posCatalog_active');
+  const originalCappedLastAll = cappedLastPage.doc.querySelectorAll;
+  cappedLastPage.doc.querySelectorAll = function (selector) {
+    if (selector === '#coursetree .posCatalog_select') return [cappedLastActive];
+    return originalCappedLastAll(selector);
+  };
+  const cappedLastQuestion = makeFeedbackQuestion(cappedLastCtx, { text: '【单选题】末章七次上限测试题干' });
+  cappedLastCtx.__test.syncPageQuizGuard(cappedLastCtx.__test.makePageQuizSignature([cappedLastQuestion]));
+  for (let i = 0; i < 7; i++) cappedLastCtx.__test.recordPageQuizSubmission();
+  cappedLastCtx.__test.abandonCurrentPageQuiz('测试末章上限');
+  assert.strictEqual(cappedLastPage.navigations(), 0, '末章达到上限后仍尝试下一节');
+  assert.strictEqual(cappedLastCtx.__autoStudyTimer, null, '末章达到上限后没有停止');
+  assert.strictEqual(cappedLastCtx.__test.AI.enabled, false);
+
+  // 结果长期不明确也必须退出等待，不能整夜刷新或重试。
+  const unclearCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const unclearPage = makeQuizResultFixture(unclearCtx, { score: null, completed: false, redo: false });
+  const unclearQuestion = makeFeedbackQuestion(unclearCtx, { text: '【单选题】结果超时退出测试题干' });
+  unclearCtx.__test.syncPageQuizGuard(unclearCtx.__test.makePageQuizSignature([unclearQuestion]));
+  unclearCtx.__test.recordPageQuizSubmission();
+  const unclearState = unclearCtx.__test.pageQuizState();
+  unclearState.doc = unclearPage.doc;
+  unclearState.submitted = true;
+  unclearState.waitingCompletion = true;
+  unclearState.submittedAt = Date.now() - 91000;
+  unclearCtx.__test.handlePageQuiz([unclearPage.doc]);
+  assert.strictEqual(unclearCtx.__autoStudyTimer, null, '提交结果 90 秒不明确时没有停止');
+  assert.strictEqual(unclearCtx.__test.AI.enabled, false);
+  assert.strictEqual(unclearPage.navigations(), 0, '结果不明确时错误跳节');
+
+  // 手动停止也必须阻断 AI 排队和后续自动跳节。
+  const manualStopCtx = createContext({ userscript: true, config, gmImpl() {} });
+  manualStopCtx.__test.pageQuizState().pending[0] = true;
+  manualStopCtx.__test.pageQuizState().needAdvance = true;
+  manualStopCtx.stopAutoStudy();
+  assert.strictEqual(manualStopCtx.__autoStudyTimer, null);
+  assert.strictEqual(manualStopCtx.__test.AI.enabled, false, '手动停止没有关闭 AI');
+  assert.strictEqual(Object.keys(manualStopCtx.__test.pageQuizState().pending).length, 0);
+  assert.strictEqual(manualStopCtx.__test.pageQuizState().needAdvance, false);
+  assert(source.includes('if (updatePageQuizEscape()) return;'), '主轮询没有接入锁章退出守护');
 
   // 最后一节停止；末章空白页也不能被“下一节”按钮绕过。
   const lastCtx = createContext({ userscript: true, config, gmImpl() {} });
@@ -1178,7 +1577,7 @@ function makeFontQuestionFixture(ctx, mode) {
   assert.deepStrictEqual(Array.from(consoleAnswer), ['C'], '控制台 fetch 通道答题失败');
   assert.strictEqual(fetchCalled, true, '控制台版没有回退到 fetch');
 
-  console.log('PASS: font restore/no DOM mutation, missing-font/missing-glyph/ambiguous-font zero requests, model-garble circuit breaker/no review fallback, plain-question regression, player-status JSONP/XHR/fetch stale-label guards, completed-video advance/no replay, multi-video guards, last-section stop/next-card guards, unsubmitted-rule/no-redo guard, failed-modal confirm/retry without completion wait, required-retry/cache-reset vs optional-redo, quiz completion-marker wait/single-refresh with and without score, completed-quiz advance/no redo/no AI, unfinished-task guards, empty-page advance, playback menu/throttle/fallback, GM/fetch AI and answer parsing');
+  console.log('PASS: font restore/no DOM mutation, missing-font/missing-glyph/ambiguous-font zero requests, model-garble circuit breaker/no review fallback, plain-question regression, player-status JSONP/XHR/fetch stale-label guards, completed-video advance/no replay, multi-video guards, video-before-quiz ordering, per-question text and empty marking_cuo/marking_dui icon feedback parsing, submitted-answer text/aria-checked recovery, duplicate-option deduplication, correct-answer retention, single-choice and all 15 four-option multi-choice candidates, candidate-exhaustion blocks, multi-choice old-answer clearing, cross-frame feedback retry, no-feedback AI retry loop guard, seven-submission cap/persistence/seventh-pass priority, single locked-section escape/8-second stop, 90-second unclear-result stop, manual-stop AI queue cutoff, last-section stop/next-card guards, unsubmitted-rule/no-redo guard, failed-modal confirm/retry without completion wait, required-retry/cache-reset vs optional-redo, quiz completion-marker wait/single-refresh with and without score, completed-quiz advance/no redo/no AI, unfinished-task guards, empty-page advance, playback menu/throttle/fallback, GM/fetch AI and answer parsing');
 })().catch(err => {
   console.error(err);
   process.exitCode = 1;

@@ -21356,6 +21356,9 @@ const CX_FONT_TABLE = Object.freeze({
  *          未知或冲突字段不猜，整分钟续播只记录诊断，不拖动进度、不点击暂停。
  * v4.26.1 修复：识别“未达到及格线，请重做”的结果浮层，优先于完成标记等待；
  *          点击“确定”等确认按钮而非“取消”，清空旧答案后接回重答，静态规则说明不误判。
+ * v1.0 发布修复：停用播放器状态探针对任务完成标签的覆盖，避免干扰平台进度上报；
+ *          同节有未完成视频时暂停章节测验；必及格测验按逐题对错反馈保留答对题，
+ *          错题使用有界候选穷举，多选重做先清旧选项，候选耗尽或结构不明时停止自动提交。
  * 手动测试：nextSection() 强制跳下一节；
  *          muteAll() 立刻静音，unmuteAll() 恢复声音并关闭自动静音；
  *          cxProbe() 打印诊断信息；quizDebug() 打印弹题的真实 DOM；
@@ -23152,19 +23155,14 @@ const CX_FONT_TABLE = Object.freeze({
       try { frame = win.frameElement; } catch (e) { break; }
       if (!frame) break;
       var type = taskFrameType(frame);
-      if (type === 'video' || type === 'audio') {
-        if (taskFrameFinished(frame)) return true;
-        var src = '';
-        try { src = frame.getAttribute('src') || frame.src || ''; } catch (e) {}
-        var status = findVideoStatusForTask(src, win);
-        if (status && status.finished) return true;
-      }
+      if ((type === 'video' || type === 'audio') && taskFrameFinished(frame)) return true;
       try { win = win.parent; } catch (e) { break; }
     }
     return false;
   }
 
-  // 任务容器与播放器明确状态都可证明完成；currentTime 本身永远不能证明完成。
+  // 只有平台任务容器的完成标记才能证明已经记账。
+  // isFinished/currentTime 只表示播放状态，不能覆盖滞后的任务标签或触发跳节。
   function findCompletedVideoTask(docs) {
     var videoTasks = [];
     var hasTaskFrames = false;
@@ -23180,12 +23178,9 @@ const CX_FONT_TABLE = Object.freeze({
         hasTaskFrames = true;
         var done = taskFrameFinished(frame);
         if (type === 'video' || type === 'audio') {
-          var src = '', frameWin = null;
+          var src = '';
           try { src = frame.getAttribute('src') || frame.src || ''; } catch (e) {}
-          try { frameWin = frame.contentWindow || null; } catch (e) {}
-          var status = findVideoStatusForTask(src, frameWin);
-          var playerDone = !!(status && status.finished);
-          videoTasks.push({ done: done || playerDone, src: src, player: playerDone && !done });
+          videoTasks.push({ done: done, src: src });
         } else if (!done) {
           pendingOtherTask = true;
         }
@@ -23196,12 +23191,12 @@ const CX_FONT_TABLE = Object.freeze({
       for (var v = 0; v < videoTasks.length; v++) if (!videoTasks[v].done) return null;
       return {
         key: videoTasks.map(function (item) { return item.src; }).join('|').slice(0, 500),
-        source: videoTasks.some(function (item) { return item.player; }) ? 'player' : 'marker'
+        source: 'marker'
       };
     }
     if (hasTaskFrames) return null;
 
-    // 非标准任务框架的兜底：明确状态或完成标记必须和 video 在同一文档。
+    // 非标准任务框架的兜底：完成标记必须和 video 在同一文档。
     for (var d2 = 0; d2 < docs.length; d2++) {
       var doc = docs[d2], videos = [], markers;
       try { videos = doc.querySelectorAll('video'); } catch (e) { continue; }
@@ -23212,12 +23207,6 @@ const CX_FONT_TABLE = Object.freeze({
         videoKeys.push(String(videos[j].currentSrc || videos[j].src || ''));
       }
       if (!visibleCount) continue;
-      if (visibleCount === 1) {
-        var directStatus = findVideoStatusForTask(videoKeys[0], doc.defaultView);
-        if (directStatus && directStatus.finished) {
-          return { key: 'player:' + (directStatus.objectId || videoKeys[0]).slice(0, 500), source: 'player' };
-        }
-      }
       try { markers = doc.querySelectorAll('.ans-job-finished,.ans-jobfinished,div,p,span'); } catch (e) { continue; }
       for (var m = 0; m < markers.length; m++) {
         if (!visible(markers[m])) continue;
@@ -23227,6 +23216,27 @@ const CX_FONT_TABLE = Object.freeze({
       }
     }
     return null;
+  }
+
+  // 同一小节有多个任务点时，必须先看完视频再处理章节测验。
+  // 否则 pageOn 会阻止 keepPlaying，导致视频未观看就直接答题。
+  function hasUnfinishedVideoTask(docs, completedResult) {
+    for (var d = 0; d < docs.length; d++) {
+      var frames;
+      try { frames = docs[d].querySelectorAll('iframe[src*="/ananas/modules/"]'); } catch (e) { continue; }
+      for (var i = 0; i < frames.length; i++) {
+        if (!visible(frames[i])) continue;
+        var type = taskFrameType(frames[i]);
+        if ((type === 'video' || type === 'audio') && !taskFrameFinished(frames[i])) return true;
+      }
+    }
+    if (completedResult) return false;
+    for (var d2 = 0; d2 < docs.length; d2++) {
+      var videos;
+      try { videos = docs[d2].querySelectorAll('video'); } catch (e) { continue; }
+      for (var j = 0; j < videos.length; j++) if (visible(videos[j])) return true;
+    }
+    return false;
   }
 
   var completedVideoState = { key: '', at: 0 };
@@ -23395,31 +23405,30 @@ const CX_FONT_TABLE = Object.freeze({
     return false;
   }
 
+  var videoCompletionWaitKey = '';
   function autoAdvance(docs, completedVideo) {
     if (advanceCooldown > 0) { advanceCooldown--; return; }
 
     var alreadyWatched = completedVideo || findCompletedVideoTask(docs);
-    if (alreadyWatched) { advanceCompletedVideo(alreadyWatched); return; }
-
-    var vids = collectVideos(docs).filter(function (v) { return !videoInFinishedTask(v); });
-    if (!vids.length) { handleEmptySection(docs); return; }
-    var anyPlaying = vids.some(function (v) { return !v.paused && !videoFinished(v); });
-    if (anyPlaying) return;
-    if (!vids.some(videoFinished)) return;
-
-    // 跨域 iframe 里看不到目录：把“播完了”通知给顶层去跳下一节
-    if (!IS_TOP) {
-      notifyTop('videoDone');
-      advanceCooldown = 20;
+    if (alreadyWatched) {
+      videoCompletionWaitKey = '';
+      advanceCompletedVideo(alreadyWatched);
       return;
     }
 
-    var active = window.top.document.querySelector('#coursetree .posCatalog_active');
-    var curId = active ? active.id : '';
-    if (curId && curId !== lastActiveId) lastActiveId = curId;
+    var vids = collectVideos(docs).filter(function (v) { return !videoInFinishedTask(v); });
+    if (!vids.length) { videoCompletionWaitKey = ''; handleEmptySection(docs); return; }
+    var anyPlaying = vids.some(function (v) { return !v.paused && !videoFinished(v); });
+    if (anyPlaying || !vids.some(videoFinished)) { videoCompletionWaitKey = ''; return; }
 
-    var moved = tryNextCard() || tryNextSection();
-    if (moved) { advanceCooldown = 5; lastActiveId = ''; }
+    // 播放结束不等于平台已经记账。等待任务容器显示完成，绝不提前跳节。
+    var waitKey = currentActiveId() + '|' + vids.map(function (v) {
+      return String(v.currentSrc || v.src || 'video');
+    }).join('|').slice(0, 400);
+    if (videoCompletionWaitKey !== waitKey) {
+      videoCompletionWaitKey = waitKey;
+      log('视频已播放到结尾，等待平台显示“任务点已完成”；确认前不重播、不跳节');
+    }
   }
 
   // ---- 跨帧协作：iframe 里完成动作后通知顶层 ----
@@ -23591,6 +23600,16 @@ const CX_FONT_TABLE = Object.freeze({
   //    自动勾选、全部答完后提交。计分任务点，默认不盲猜。
   // ============================================================
   var pageQuizCache = {};                                  // 题干 -> 字母数组
+  var pageQuizLearning = {};                               // 题干 -> 已试答案、已知正确答案
+
+  function pageQuizQuestionKey(q) {
+    return String(q && q.text || '')
+      .replace(/(?:本题)?(?:回答|作答|答题)(?:结果)?(?:正确|错误|答对|答错|不正确)/g, '')
+      .replace(/本题(?:正确|错误|答对|答错|不正确)/g, '')
+      .replace(/本题得分[:：]?\d+(?:\.\d+)?分?/g, '')
+      .replace(/\s+/g, '').slice(0, 150);
+  }
+
   var pageQuizState = { sig: '', active: false, applied: {}, appliedAt: {}, pending: {}, fails: {},
                         submitted: false, submittedAt: 0, warnedNoAI: false, done: false,
                         repairCount: 0, selectFails: {}, warnedSelect: false,
@@ -24057,23 +24076,166 @@ const CX_FONT_TABLE = Object.freeze({
     return true;
   }
 
+  function setPageInputChecked(opt, checked) {
+    if (!opt || !opt.input) return;
+    try {
+      var win = opt.input.ownerDocument.defaultView || window;
+      var desc = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, 'checked');
+      if (desc && desc.set) desc.set.call(opt.input, checked); else opt.input.checked = checked;
+      opt.input.dispatchEvent(new win.Event('input', { bubbles: true }));
+      opt.input.dispatchEvent(new win.Event('change', { bubbles: true }));
+    } catch (e) {}
+  }
+
+  function clearPageAnswer(q) {
+    for (var i = 0; i < q.opts.length; i++) {
+      var opt = q.opts[i];
+      try {
+        if (opt.input) {
+          if (opt.input.checked || rowSelected(opt.el)) selectRowDeep(opt.el);
+          if (opt.input.checked) setPageInputChecked(opt, false);
+        } else if (rowSelected(opt.el)) {
+          selectRowDeep(opt.el);
+        }
+      } catch (e) {}
+    }
+  }
+
   function applyPageAnswer(q, letters) {
+    // 重做时平台可能保留旧选项；先清空，避免多选把新旧答案叠加。
+    clearPageAnswer(q);
     for (var i = 0; i < q.opts.length; i++) {
       var opt = q.opts[i];
       if (letters.indexOf(opt.letter) === -1) continue;
       if (opt.input && opt.input.checked) continue;
-      if (rowSelected(opt.el)) continue;        // 已经选中就别再点，多选框会被点掉
-      selectRowDeep(opt.el);
-      if (opt.input && !opt.input.checked) {
-        try {
-          var win = opt.input.ownerDocument.defaultView || window;
-          var desc = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, 'checked');
-          if (desc && desc.set) desc.set.call(opt.input, true); else opt.input.checked = true;
-          opt.input.dispatchEvent(new win.Event('input', { bubbles: true }));
-          opt.input.dispatchEvent(new win.Event('change', { bubbles: true }));
-        } catch (e) {}
+      if (!opt.input && rowSelected(opt.el)) continue;
+      if (!rowSelected(opt.el)) selectRowDeep(opt.el);
+      if (opt.input && !opt.input.checked) setPageInputChecked(opt, true);
+    }
+  }
+
+  function canonicalPageAnswer(q, letters) {
+    var out = [];
+    if (!q || !letters) return out;
+    for (var i = 0; i < q.opts.length; i++) {
+      if (letters.indexOf(q.opts[i].letter) > -1) out.push(q.opts[i].letter);
+    }
+    return out;
+  }
+
+  function readSubmittedPageAnswer(q) {
+    var text = '';
+    try { text = tightText(q.block); } catch (e) { return []; }
+    var match = text.match(/(?:你的答案|我的答案|你的作答|我的作答|考生答案)[:：]([A-H](?:[,，、;；\/]?[A-H])*)/i);
+    if (!match) return [];
+    return canonicalPageAnswer(q, parseAnswerLetters('答案：' + match[1], q.opts.length, q.type === 'multi'));
+  }
+
+  function isPageOptionNode(q, el) {
+    for (var i = 0; i < q.opts.length; i++) {
+      var row = q.opts[i].el;
+      if (!row) continue;
+      if (row === el) return true;
+      try { if (row.contains(el) || el.contains(row)) return true; } catch (e) {}
+    }
+    return false;
+  }
+
+  // 只接受题目区域内明确的对错标记；选项“正确/错误”和“正确答案：A”不能当结果。
+  function readPageQuestionFeedback(q) {
+    if (!q || !q.block) return null;
+    var nodes = [];
+    try { nodes = q.block.querySelectorAll('*'); } catch (e) { return null; }
+    var wrong = false, correct = false;
+    function inspect(el) {
+      if (!el || !visible(el) || isPageOptionNode(q, el)) return;
+      var text = tightText(el);
+      if (text.length > 50) return;
+      var wrongText = /^(?:[×✕✗Xx])?(?:(?:本题)?(?:回答|作答|答题)(?:结果)?|本题)?(?:错误|不正确|答错)[。.!！]*$/.test(text);
+      var correctText = /^(?:[√✓])?(?:(?:本题)?(?:回答|作答|答题)(?:结果)?|本题)?(?:正确|答对)[。.!！]*$/.test(text);
+      if (wrongText) wrong = true;
+      if (correctText) correct = true;
+      if (text.length > 20) return;
+      var c = el.className, cls = typeof c === 'string' ? c : (c && c.baseVal) || '';
+      if (/(^|[\s_-])(wrong|incorrect|error)(?=$|[\s_-])/i.test(cls)) wrong = true;
+      if (/(^|[\s_-])(right|correct)(?=$|[\s_-])/i.test(cls)) correct = true;
+    }
+    inspect(q.stemEl);
+    for (var i = 0; i < nodes.length; i++) inspect(nodes[i]);
+    if (wrong && correct) return null;             // 冲突时不猜
+    if (wrong) return 'wrong';
+    if (correct) return 'correct';
+    return null;
+  }
+
+  function pageQuizLearningRecord(key) {
+    if (!pageQuizLearning[key]) pageQuizLearning[key] = { tried: {}, correctAnswer: '' };
+    return pageQuizLearning[key];
+  }
+
+  // 单选/判断逐个尝试；多选按组合大小递增，最多 6 个选项（63 个非空组合）。
+  function nextPageQuizCandidate(q, record) {
+    var n = q && q.opts ? q.opts.length : 0;
+    if (n < 2 || n > 8 || (q.type === 'multi' && n > 6)) return [];
+    var tried = record && record.tried ? record.tried : {};
+    var letters = [];
+    for (var i = 0; i < n; i++) letters.push(q.opts[i].letter);
+    if (q.type !== 'multi') {
+      for (var s = 0; s < n; s++) if (!tried[letters[s]]) return [letters[s]];
+      return [];
+    }
+    var total = 1 << n;
+    for (var size = 1; size <= n; size++) {
+      for (var mask = 1; mask < total; mask++) {
+        var bits = 0;
+        for (var b = 0; b < n; b++) if (mask & (1 << b)) bits++;
+        if (bits !== size) continue;
+        var answer = '';
+        for (var j = 0; j < n; j++) if (mask & (1 << j)) answer += letters[j];
+        if (!tried[answer]) return answer.split('');
       }
     }
+    return [];
+  }
+
+  // 根据结果页逐题反馈生成下一轮缓存：答对保留，答错换未试答案，未知题交给 AI。
+  function buildPageQuizRetryPlan(qs) {
+    var plan = { found: 0, correct: 0, wrong: 0, changed: 0, unknown: 0,
+      cache: {}, blocked: [], details: [] };
+    for (var i = 0; i < qs.length; i++) {
+      var q = qs[i], status = readPageQuestionFeedback(q), key = pageQuizQuestionKey(q);
+      if (!key) continue;
+      var record = pageQuizLearningRecord(key);
+      var previous = canonicalPageAnswer(q, pageQuizCache[key]);
+      if (!previous.length) previous = readSubmittedPageAnswer(q);
+      if (previous.length) record.tried[previous.join('')] = true;
+
+      if (!status) {
+        if (record.correctAnswer) plan.cache[key] = record.correctAnswer.split('');
+        else plan.unknown++;
+        continue;
+      }
+      plan.found++;
+      if (status === 'correct') {
+        plan.correct++;
+        if (previous.length) record.correctAnswer = previous.join('');
+        if (record.correctAnswer) plan.cache[key] = record.correctAnswer.split('');
+        else plan.blocked.push(i + 1);       // 知道答对却无法还原答案，不能安全重交
+        continue;
+      }
+
+      plan.wrong++;
+      record.correctAnswer = '';
+      var next = nextPageQuizCandidate(q, record);
+      if (!next.length) {
+        plan.blocked.push(i + 1);
+        continue;
+      }
+      plan.cache[key] = next;
+      plan.changed++;
+      plan.details.push((i + 1) + ':' + next.join(''));
+    }
+    return plan;
   }
 
   // 两类结果页必须分开：必须及格的重做页没有分数；公布分数页的重做只是可选项。
@@ -24162,8 +24324,12 @@ const CX_FONT_TABLE = Object.freeze({
     completedPageQuizState.key = '';
     completedPageQuizState.at = 0;
 
-    // 点击后旧结果 DOM 可能还停留几秒，同一结果不能反复点重做。
+    // 点击后旧结果 DOM 可能还停留几秒，同一结果不能反复生成候选或点击。
     if (pageQuizState.retryHandled && pageQuizState.retryKey === result.key) return true;
+    var retryPlan = null;
+    try { retryPlan = buildPageQuizRetryPlan(parsePageQuestions([result.doc])); } catch (e) {}
+    var useFeedback = !!(retryPlan && retryPlan.found > 0);
+
     clearPlatformCompletionWait('quiz');
     pageQuizState.waitingCompletion = false;
     pageQuizState.retryHandled = true;
@@ -24175,15 +24341,26 @@ const CX_FONT_TABLE = Object.freeze({
     pageQuizState.selectFails = {};
     pageQuizState.warnedSelect = false;
     pageQuizState.warnedSelect2 = false;
-    // 绝不能把上一轮答案缓存带进重做，否则只会重复提交同一套错误答案。
-    pageQuizCache = {};
+    // 有逐题反馈时保留答对答案并给错题换候选；否则维持原来的 AI 重新作答。
+    pageQuizCache = useFeedback ? retryPlan.cache : {};
 
     if (!result.redo) {
       log('⚠️ 章节测验：' + result.reason + '，但没找到可用的确认或“重做”按钮；已停止跳节，请人工处理');
       return true;
     }
+    if (useFeedback && (retryPlan.blocked.length || (!retryPlan.changed && !retryPlan.unknown))) {
+      log('⚠️ 章节测验：已读取逐题反馈，但无法安全生成下一轮答案（题号 ' +
+        (retryPlan.blocked.join('、') || '全部') + '）。可能候选已试完、选项过多或答对答案无法还原；已停止自动重做，请人工处理');
+      return true;
+    }
+
     pageQuizRetryAttempt++;
-    if (result.modal) {
+    if (useFeedback) {
+      log('章节测验：反馈式穷举第 ' + pageQuizRetryAttempt + ' 轮，保留 ' + retryPlan.correct +
+        ' 道答对题，为 ' + retryPlan.changed + ' 道错题更换未试答案' +
+        (retryPlan.unknown ? '，另有 ' + retryPlan.unknown + ' 题重新交给 AI' : '') +
+        '；本轮 ' + retryPlan.details.slice(0, 12).join('，'));
+    } else if (result.modal) {
       log('章节测验：' + result.reason + '，点击失败弹窗确认；开始第 ' + pageQuizRetryAttempt +
         ' 次重做，旧答案缓存已清空，将重新请求 AI 作答');
     } else {
@@ -24441,8 +24618,9 @@ const CX_FONT_TABLE = Object.freeze({
     pageQuizState.active = true;
 
     var sig = '';
-    for (var i = 0; i < qs.length; i++) sig += qs[i].text.slice(0, 40) + '#';
+    for (var i = 0; i < qs.length; i++) sig += pageQuizQuestionKey(qs[i]).slice(0, 40) + '#';
     if (sig !== pageQuizState.sig) {
+      pageQuizLearning = {};
       pageQuizState = { sig: sig, active: true, applied: {}, appliedAt: {}, pending: {}, fails: {},
                         submitted: false, submittedAt: 0, warnedNoAI: false, done: false,
                         repairCount: 0, selectFails: {}, warnedSelect: false,
@@ -24463,7 +24641,13 @@ const CX_FONT_TABLE = Object.freeze({
       log('章节测验：检测到重新作答页面，已重新启动作答流程');
     }
 
-    if (!AI.enabled || !AI.key) {
+    var canUseAI = !!(AI.enabled && AI.key);
+    var hasCachedAnswers = false;
+    for (var c = 0; c < qs.length; c++) {
+      var cached = pageQuizCache[pageQuizQuestionKey(qs[c])];
+      if (cached && cached.length) { hasCachedAnswers = true; break; }
+    }
+    if (!canUseAI && !hasCachedAnswers) {
       if (!pageQuizState.warnedNoAI) {
         pageQuizState.warnedNoAI = true;
         if (!AI.__fatalLogged) {
@@ -24474,20 +24658,30 @@ const CX_FONT_TABLE = Object.freeze({
       return true;
     }
 
-    // 逐题取答案并勾选（AI 异步，每题一次，命中缓存不重复请求）
+    // 逐题取答案并勾选。反馈穷举可直接使用缓存；未知题仍需要 AI，不能带空题交卷。
     var allAnswered = true;
     for (var k = 0; k < qs.length; k++) {
       var q = qs[k];
-      var key = q.text.slice(0, 150);
+      var key = pageQuizQuestionKey(q);
       var letters = pageQuizCache[key];
       if (!letters) {
         allAnswered = false;
+        if (!canUseAI) {
+          if (!pageQuizState.warnedNoAI) {
+            pageQuizState.warnedNoAI = true;
+            if (!AI.__fatalLogged) {
+              log('⚠️ 章节测验：已应用逐题反馈缓存，但仍有题目没有候选答案；需要 AI Key，当前不会自动交卷。');
+              promptForAIKey();
+            }
+          }
+          continue;
+        }
         if (pageQuizState.fails[k] >= 3) continue;   // 连试 3 次都失败就放弃这题，避免刷屏
         if (!pageQuizState.pending[k]) {
           pageQuizState.pending[k] = true;
           (function (qq, idx, st) {
             aiAskPage(qq).then(function (ans) {
-              if (ans && ans.length) pageQuizCache[qq.text.slice(0, 150)] = ans;
+              if (ans && ans.length) pageQuizCache[pageQuizQuestionKey(qq)] = ans;
               if (st !== pageQuizState) return;   // 已换题/换页，旧请求不能污染新状态
               st.pending[idx] = false;
               if (ans && ans.length) return;
@@ -24606,19 +24800,24 @@ const CX_FONT_TABLE = Object.freeze({
     tick++;
     var docs = allDocs();
     var roots = allRoots();
-    for (var s = 0; s < docs.length; s++) {
-      try { installVideoStatusProbe(docs[s].defaultView); } catch (e) {}
-    }
-    try { diagnoseVideoResume(docs); } catch (e) {}
+    // 不包装播放器 XHR/fetch，避免探针干扰平台自身的进度上报。
     var completedVideoTask = null;
     try { completedVideoTask = findCompletedVideoTask(docs); } catch (e) {}
+    var pendingVideoTask = false;
+    try { pendingVideoTask = hasUnfinishedVideoTask(docs, completedVideoTask); } catch (e) {}
+    if (pendingVideoTask && !window.__autoStudyVideoBeforeQuizLogged) {
+      window.__autoStudyVideoBeforeQuizLogged = true;
+      log('任务顺序：同节还有未完成视频，暂停章节测验，先观看视频');
+    } else if (!pendingVideoTask) {
+      window.__autoStudyVideoBeforeQuizLogged = false;
+    }
 
     // 弹题是全局的（可能在任意 iframe / shadow root 里），每轮只扫一次
     var quizOn = false;
     try { quizOn = handleVideoQuiz(roots); } catch (e) { console.warn('[自动刷课] 弹题处理异常', e); }
 
     var pageOn = false;
-    if (!quizOn) {
+    if (!quizOn && !pendingVideoTask) {
       try { pageOn = handlePageQuiz(roots); } catch (e) { console.warn('[自动刷课] 章节测验处理异常', e); }
     }
 

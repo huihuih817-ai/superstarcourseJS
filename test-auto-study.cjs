@@ -61,6 +61,10 @@ source = source.replace(marker, `  window.__test = {
     findCompletedPageQuiz: findCompletedPageQuiz,
     handlePageQuiz: handlePageQuiz,
     handleEmptySection: handleEmptySection,
+    findCompletedArticleTask: findCompletedArticleTask,
+    handleArticleReading: handleArticleReading,
+    advanceCompletedArticle: advanceCompletedArticle,
+    onTopMessage: onTopMessage,
     emptySectionState: emptySectionState
   };
 ${marker}`);
@@ -363,6 +367,306 @@ function makeVideoTaskFixture(ctx, options) {
   };
 }
 
+function makeArticleTaskFixture(ctx, options) {
+  options = options || {};
+  const doc = ctx.document;
+  const active = makeElement(doc, '5.1 文章阅读');
+  active.id = 'cur51';
+  active.className = 'posCatalog_select posCatalog_active';
+  const next = makeElement(doc, '5.2 下一节');
+  next.id = 'cur52';
+  next.className = 'posCatalog_select';
+  const nextInner = makeElement(doc, '5.2 下一节');
+  let navigations = 0;
+  let completed = !!options.completed;
+  const windowScrolls = [];
+  nextInner.click = function () { navigations++; };
+  next.querySelector = function (selector) {
+    return selector.includes('.posCatalog_name') ? nextInner : null;
+  };
+  next.click = function () {};
+
+  const longText = options.short ? '短正文' : '劳动教育长文章正文，包含需要完整阅读的课程内容。'.repeat(12);
+  const article = makeElement(doc, longText);
+  article.className = 'article-content';
+  article.scrollHeight = options.internalScroll === false ? 300 : 1200;
+  article.clientHeight = 300;
+  article.scrollTop = 0;
+  const marker = makeElement(doc, '任务点已完成');
+  marker.parentElement = article;
+  const video = makeElement(doc, '');
+  video.paused = false;
+  video.currentSrc = 'https://example.test/article-video.mp4';
+
+  const frames = [];
+  function addFrame(type, done) {
+    const parent = makeElement(doc, '');
+    parent.className = done ? 'ans-job-finished' : 'ans-job';
+    const src = 'https://example.test/ananas/modules/' + type + '/index.html?objectId=article' + (frames.length + 1);
+    const frame = makeElement(doc, '');
+    frame.parentElement = parent;
+    frame.src = src;
+    frame.contentDocument = doc;
+    frame.contentWindow = ctx;
+    frame.getAttribute = function (name) { return name === 'src' ? src : null; };
+    frame.closest = function (selector) {
+      return done && selector.includes('.ans-job-finished') ? parent : null;
+    };
+    frames.push(frame);
+  }
+  if (options.framed) {
+    addFrame('read', !!options.completed);
+    if (options.pendingWork) addFrame('work', false);
+  }
+
+  const semanticSelector = 'article,main,[class*="article" i],[class*="read" i],' +
+    '[class*="content" i],[id*="article" i],[id*="read" i],[id*="content" i]';
+  const markerSelector = '.ans-job-finished,.ans-jobfinished,div,p,span,section,article';
+  function syncBody() {
+    doc.body.textContent = (completed ? '任务点已完成 ' : '') +
+      (options.quiz ? '【单选题】文章中的测验 ' : '') + longText;
+  }
+  syncBody();
+  doc.scrollingElement = doc.documentElement;
+  doc.documentElement.scrollHeight = options.documentScroll === false ? 400 : 1600;
+  doc.documentElement.clientHeight = 400;
+  doc.documentElement.scrollTop = 0;
+  doc.body.scrollHeight = doc.documentElement.scrollHeight;
+  doc.body.clientHeight = 400;
+  ctx.innerHeight = 400;
+  ctx.pageYOffset = 0;
+  ctx.scrollTo = function (x, y) {
+    windowScrolls.push(y);
+    ctx.pageYOffset = y;
+    doc.documentElement.scrollTop = y;
+  };
+
+  let taskIcon = null;
+  if (options.taskDone || options.taskPending) {
+    taskIcon = makeElement(doc, '');
+    taskIcon.className = 'ans-job-icon ans-job-doc';
+    const label = options.taskDone ? '任务点已完成' : '任务点未完成';
+    taskIcon.getAttribute = function (name) { return name === 'aria-label' ? label : null; };
+  }
+  if (options.sectionDone) {
+    const doneIcon = makeElement(doc, '');
+    doneIcon.className = 'icon-wancheng complete';
+    active.querySelector = function (selector) {
+      return selector.indexOf('complete') >= 0 ? doneIcon : null;
+    };
+  }
+  doc.querySelector = function (selector) {
+    if (selector === '#coursetree .posCatalog_active') return active;
+    return null;
+  };
+  article.querySelectorAll = function (selector) {
+    if (selector === semanticSelector) return [article];
+    return [];
+  };
+  doc.querySelectorAll = function (selector) {
+    if (selector === 'iframe') return frames;
+    if (selector === 'iframe[src*="/ananas/modules/"]') return frames;
+    if (selector === '#coursetree .posCatalog_select') return [active, next];
+    if (selector === '#prev_tab .prev_ul li, .prev_ul li') return [];
+    if (selector === semanticSelector) return options.semantic === false ? [] : [article];
+    if (selector === 'article,main,section,div') return [article];
+    if (selector === markerSelector) return completed ? [marker] : [];
+    if (selector === 'video') return options.video ? [video] : [];
+    if (selector === '[class*="ans-job-icon"]') return taskIcon ? [taskIcon] : [];
+    return [];
+  };
+  return {
+    doc,
+    article,
+    complete() { completed = true; syncBody(); },
+    navigations: () => navigations,
+    windowScrolls
+  };
+}
+
+// 文档阅读页（云盘 PDF 预览）：滚动条在阅读页自己的 <html> 上，正文是分页图片。
+let previewDocSeq = 0;
+function makePreviewArticleFixture(ctx, options) {
+  options = options || {};
+  const height = options.height || 1600;
+  const viewport = options.viewport || 400;
+  const view = {
+    innerHeight: viewport,
+    pageYOffset: 0,
+    scrollCalls: [],
+    frameElement: options.frameElement || null,
+    location: { href: 'https://pan-yz.chaoxing.com/preview/v2/doc-' + (++previewDocSeq) + '.html' },
+    Event: function (type) { return { type: type }; },
+    dispatchEvent() { return true; },
+    getComputedStyle() { return { display: 'block', visibility: 'visible', opacity: '1' }; }
+  };
+  const doc = {
+    title: '文档',
+    defaultView: view,
+    body: null,
+    documentElement: null,
+    scrollingElement: null,
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    getElementById() { return null; },
+    createElement() { return makeElement(doc, ''); },
+    dispatchEvent() { return true; },
+    addEventListener() {}
+  };
+  const de = makeElement(doc, '');
+  const body = makeElement(doc, '');
+  de.scrollHeight = height;
+  de.clientHeight = viewport;
+  de.scrollTop = 0;
+  body.scrollHeight = height;
+  body.clientHeight = viewport;
+  body.scrollTop = 0;
+  doc.documentElement = de;
+  doc.body = body;
+  doc.scrollingElement = de;
+  view.document = doc;
+  view.scrollTo = function (x, y) {
+    const max = Math.max(0, height - viewport);
+    const top = Math.max(0, Math.min(max, Number(y) || 0));
+    view.pageYOffset = top;
+    de.scrollTop = top;
+    view.scrollCalls.push(top);
+  };
+
+  const fileBox = makeElement(doc, '');
+  fileBox.className = 'fileBox';
+  fileBox.scrollHeight = 300;
+  fileBox.clientHeight = 300;
+  fileBox.scrollTop = 0;
+  const anchor1 = makeElement(doc, '1');
+  anchor1.id = 'anchor1';
+  const anchor2 = makeElement(doc, '2');
+  anchor2.id = 'anchor2';
+  const img1 = makeElement(doc, '');
+  img1.src = 'https://s3.cldisk.com/sv-w9/doc/14/7e/4c/c6632a3d26c1fa183e11fd3b4f4a2184/thumb/1.png';
+  const img2 = makeElement(doc, '');
+  img2.src = 'https://s3.cldisk.com/sv-w9/doc/14/7e/4c/c6632a3d26c1fa183e11fd3b4f4a2184/thumb/2.png';
+  const slider = makeElement(doc, '');
+  const pageNum = makeElement(doc, '1');
+  const footer = makeElement(doc, '100%');
+  const markData = makeElement(doc, '{"resourceID":"c6632a3d26c1fa183e11fd3b4f4a2184"}');
+  const map = {
+    '.fileBox': [fileBox],
+    '.fileBox img': [img1, img2],
+    '.fileBox li[id^="anchor"] img': [img1, img2],
+    'li[id^="anchor"]': [anchor1, anchor2],
+    'img[src*="/thumb/"]': [img1, img2],
+    '#zoomSlider': [slider],
+    '.zoom-slider': [slider],
+    '.pageNum': [pageNum],
+    '.preview-dialog__footer': [footer],
+    'article,main,section,div': [fileBox, footer],
+    'video': [],
+    'iframe': [],
+    'iframe[src*="/ananas/modules/"]': [],
+    '.ans-job-finished,.ans-jobfinished,span,div,p,em,i,b': [],
+    '.ans-job-finished,.ans-jobfinished,div,p,span,section,article': []
+  };
+  doc.querySelectorAll = function (selector) { return map[selector] || []; };
+  doc.querySelector = function (selector) {
+    if (selector === '#markDataStr') return markData;
+    return null;
+  };
+  return { doc, view, fileBox, pageScrolled: () => view.pageYOffset };
+}
+
+// 顶层课程页外壳：目录树 + 文章阅读 iframe（contentDocument 指向阅读页文档）。
+// options.preview / options.completed 是第一个任务点；options.preview2 / options.completed2 可选第二个。
+function makeArticleShellFixture(ctx, options) {
+  options = options || {};
+  const doc = ctx.document;
+  const active = makeElement(doc, '1.1 资料论文');
+  active.id = 'cur11';
+  active.className = 'posCatalog_select posCatalog_active';
+  const next = makeElement(doc, '1.2 下一节');
+  next.id = 'cur12';
+  next.className = 'posCatalog_select';
+  const nextInner = makeElement(doc, '1.2 下一节');
+  let navigations = 0;
+  nextInner.click = function () { navigations++; };
+  next.querySelector = function (selector) {
+    return selector.includes('.posCatalog_name') ? nextInner : null;
+  };
+  next.click = function () {};
+
+  const tree = makeElement(doc, '第一章 第二章');
+  tree.id = 'coursetree';
+  tree.scrollHeight = 2400;
+  tree.clientHeight = 500;
+  tree.scrollTop = 0;
+  tree.querySelectorAll = function () { return []; };
+
+  const taskBoxes = [];
+  const frames = [];
+  function addArticleFrame(preview, done) {
+    const box = makeElement(doc, '资料论文 任务点');
+    box.className = done ? 'ans-job-finished' : 'ans-job';
+    const f = makeElement(doc, '');
+    f.src = 'https://pan-yz.chaoxing.com/preview/v2/objectshowpreview.html?objectid=' + (frames.length + 1);
+    f.getAttribute = function (name) { return name === 'src' ? f.src : null; };
+    f.contentDocument = preview ? preview.doc : null;
+    f.contentWindow = preview ? preview.view : null;
+    f.parentElement = box;
+    f.closest = function (selector) {
+      return selector.indexOf('.ans-job-finished') >= 0 && box.className.indexOf('ans-job-finished') >= 0
+        ? box : null;
+    };
+    f.querySelectorAll = function () { return []; };
+    box.querySelectorAll = function (selector) {
+      if (selector === 'iframe') return [f];
+      return [];
+    };
+    box.querySelector = function () { return null; };
+    taskBoxes.push(box);
+    frames.push(f);
+    if (preview) {
+      try { preview.view.frameElement = f; } catch (e) {}
+    }
+    return f;
+  }
+  const firstFrame = addArticleFrame(options.preview, !!options.completed);
+  if (options.preview2) addArticleFrame(options.preview2, !!options.completed2);
+  function doneBoxes() {
+    return taskBoxes.filter(function (box) { return box.className.indexOf('ans-job-finished') >= 0; });
+  }
+
+  doc.body.textContent = '资料论文 任务点 第一章 第二章';
+  doc.querySelector = function (selector) {
+    if (selector === '#coursetree .posCatalog_active') return active;
+    if (selector === '#coursetree') return tree;
+    return null;
+  };
+  doc.querySelectorAll = function (selector) {
+    if (selector === 'iframe') return frames;
+    if (selector === 'iframe[src*="/ananas/modules/"]') return [];
+    if (selector === '#coursetree .posCatalog_select') return [active, next];
+    if (selector === '#prev_tab .prev_ul li, .prev_ul li') return options.cards || [];
+    if (selector === 'article,main,section,div') return [tree].concat(taskBoxes);
+    if (selector === '.ans-job-finished,.ans-jobfinished,div,p,span,section,article') return doneBoxes();
+    return [];
+  };
+  ctx.innerHeight = 500;
+  ctx.pageYOffset = 0;
+  ctx.scrollTo = function (x, y) { ctx.pageYOffset = y; };
+  return {
+    doc,
+    tree,
+    frame: firstFrame,
+    taskBox: taskBoxes[0],
+    frames,
+    taskBoxes,
+    navigations: () => navigations,
+    complete() {
+      if (taskBoxes[0]) taskBoxes[0].className = 'ans-job-finished';
+    }
+  };
+}
+
 function makeQuizResultFixture(ctx, options) {
   options = options || {};
   const doc = ctx.document;
@@ -385,17 +689,22 @@ function makeQuizResultFixture(ctx, options) {
   const failed = !!options.failed;
   const score = options.score == null ? null : options.score;
   const hasRedo = options.redo !== false;
-  const hasFailureModal = !!options.failureModal;
+  let hasFailureModal = !!options.failureModal;
+  const closeModalOnCancel = options.closeModalOnCancel !== false;
   const taskDone = makeElement(doc, '任务点已完成');
   const failedMarker = makeElement(doc, options.failureText || '本次测验不及格，请重做');
   const scoreMarker = makeElement(doc, score == null ? '' : `本次成绩 ${score} 分`);
   const redo = makeElement(doc, options.redoText || '重做');
   redo.click = function () { redoClicks++; };
-  const modal = makeElement(doc, hasFailureModal ? '未达到及格线，请重做 取消 确定' : '');
+  const modal = makeElement(doc, hasFailureModal ?
+    (options.failureModalText || '未达到及格线，是否重新提交？ 取消 确定') : '');
   modal.className = 'modal dialog';
   const cancel = makeElement(doc, '取消');
   const confirm = makeElement(doc, '确定');
-  cancel.click = function () { cancelClicks++; };
+  cancel.click = function () {
+    cancelClicks++;
+    if (closeModalOnCancel) { hasFailureModal = false; sync(); }
+  };
   confirm.click = function () { confirmClicks++; };
   modal.querySelectorAll = function (selector) {
     return /button|span|div|label|input/.test(selector) ? [cancel, confirm] : [];
@@ -785,6 +1094,177 @@ function makeFontQuestionFixture(ctx, mode) {
     '同页还有未完成测验任务时不能跳过整节'
   );
 
+  // ---- 文章阅读：滚阅读页自己的 <html>，绝不是课程页目录/内容面板 ----
+  const articleCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const article = makeArticleTaskFixture(articleCtx);
+  for (let i = 0; i < 8; i++) articleCtx.__test.handleArticleReading([article.doc]);
+  assert.strictEqual(article.article.scrollTop, 900, '长文章内部小窗口没有滚动到底部');
+  assert.strictEqual(article.windowScrolls.length, 0, '文章功能不应滚动网页本身');
+  assert.strictEqual(article.doc.documentElement.scrollTop, 0, '文章功能不应移动文档滚动条');
+  assert.strictEqual(article.navigations(), 0, '文章滚到底部但平台未完成时不应跳节');
+  assert.strictEqual(articleCtx.__test.findCompletedArticleTask([article.doc]), null);
+  article.complete();
+  articleCtx.__test.autoAdvance([article.doc]);
+  assert.strictEqual(article.navigations(), 1, '平台显示文章完成后没有进入下一节');
+  articleCtx.__test.handleArticleReading([article.doc]);
+  assert.strictEqual(article.navigations(), 1, '同一文章完成标记不应重复跳节');
+
+  const documentOnlyArticleCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const documentOnlyArticle = makeArticleTaskFixture(documentOnlyArticleCtx, { internalScroll: false });
+  for (let i = 0; i < 3; i++) documentOnlyArticleCtx.__test.handleArticleReading([documentOnlyArticle.doc]);
+  assert.strictEqual(documentOnlyArticle.windowScrolls.length, 0, '顶层文章页没有内部容器时不应滚网页自己的滚动条');
+  assert.strictEqual(documentOnlyArticle.doc.documentElement.scrollTop, 0);
+  assert.strictEqual(documentOnlyArticle.navigations(), 0);
+
+  // 文档阅读页（云盘 PDF 预览）：滚动条在阅读页自己的 <html> 上
+  const previewCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const preview = makePreviewArticleFixture(previewCtx);
+  for (let i = 0; i < 6; i++) previewCtx.__test.handleArticleReading([preview.doc]);
+  assert.strictEqual(preview.pageScrolled(), 1200, '阅读页 <html> 滚动条没有滚到底部');
+  assert(preview.view.scrollCalls.length >= 2, '阅读页应当分步滚动，而不是一次跳到底');
+  assert.strictEqual(preview.fileBox.scrollTop, 0, '阅读页里的分页图片容器不应被滚动');
+
+  // 阅读页嵌在课程页 iframe 里：滚 iframe 的 <html>，课程页目录和页面都不能动
+  const shellCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const shellPreview = makePreviewArticleFixture(shellCtx);
+  const shell = makeArticleShellFixture(shellCtx, { preview: shellPreview });
+  for (let i = 0; i < 6; i++) shellCtx.__test.handleArticleReading([shell.doc, shellPreview.doc]);
+  assert.strictEqual(shellPreview.pageScrolled(), 1200, 'iframe 里的阅读页 <html> 没有滚到底');
+  assert.strictEqual(shell.tree.scrollTop, 0, '课程页目录树被当成阅读滚动条滚了');
+  assert.strictEqual(shellCtx.pageYOffset, 0, '顶层课程页被滚动了');
+  assert.strictEqual(shell.navigations(), 0, '未完成时不应跳节');
+
+  // 滚动之后才出现完成标记：检测到完成立即跳节，不再继续滚
+  const lateShellCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const latePreview = makePreviewArticleFixture(lateShellCtx);
+  const lateShell = makeArticleShellFixture(lateShellCtx, { preview: latePreview });
+  lateShellCtx.__test.handleArticleReading([lateShell.doc, latePreview.doc]);
+  assert(latePreview.pageScrolled() > 0 && latePreview.pageScrolled() < 1200, '阅读页没有开始向下滚动');
+  lateShell.complete();
+  lateShellCtx.__test.handleArticleReading([lateShell.doc, latePreview.doc]);
+  assert.strictEqual(lateShell.navigations(), 1, '滚动后检测到完成标记没有跳节');
+
+  // 一个节点里有多篇文章：先等平台给第一篇打标，等不到再滚第二篇
+  const multiArticleCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const multiFirst = makePreviewArticleFixture(multiArticleCtx);
+  const multiSecond = makePreviewArticleFixture(multiArticleCtx);
+  for (let i = 0; i < 6; i++) {
+    multiArticleCtx.__test.handleArticleReading([multiFirst.doc, multiSecond.doc]);
+  }
+  assert.strictEqual(multiFirst.pageScrolled(), 1200, '多文章节点里第一篇没有滚到底');
+  assert.strictEqual(multiSecond.pageScrolled(), 0, '刚滚完第一篇就立刻滚第二篇，没有等平台打标');
+  const realNow = Date.now;
+  Date.now = () => realNow() + 10000;
+  try {
+    for (let i = 0; i < 6; i++) {
+      multiArticleCtx.__test.handleArticleReading([multiFirst.doc, multiSecond.doc]);
+    }
+  } finally {
+    Date.now = realNow;
+  }
+  assert.strictEqual(multiSecond.pageScrolled(), 1200, '等待结束后第二篇没有滚到底');
+
+  // 目录已完成的小节：直接跳过，绝不重复滚文章（截图里目录的绿色对勾）
+  const sectionDoneCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const sectionDoneArticle = makeArticleTaskFixture(sectionDoneCtx, { sectionDone: true });
+  sectionDoneCtx.__test.autoAdvance([sectionDoneArticle.doc]);
+  assert.strictEqual(sectionDoneArticle.navigations(), 1, '目录显示本节已完成时没有跳过');
+  assert.strictEqual(sectionDoneArticle.article.scrollTop, 0, '本节已完成时不应再滚动文章');
+
+  // 任务点图标 aria-label=任务点已完成：整节完成，不滚
+  const iconDoneCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const iconDoneArticle = makeArticleTaskFixture(iconDoneCtx, { taskDone: true });
+  iconDoneCtx.__test.autoAdvance([iconDoneArticle.doc]);
+  assert.strictEqual(iconDoneArticle.navigations(), 1, '任务点图标已完成时没有跳过本节');
+  assert.strictEqual(iconDoneArticle.article.scrollTop, 0, '任务点图标已完成时不应再滚动文章');
+
+  // 任务点图标“任务点未完成”：不能当成完成，要滚
+  const iconPendingCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const iconPendingArticle = makeArticleTaskFixture(iconPendingCtx, { taskPending: true });
+  for (let i = 0; i < 8; i++) iconPendingCtx.__test.handleArticleReading([iconPendingArticle.doc]);
+  assert.strictEqual(iconPendingArticle.article.scrollTop, 900, '任务点未完成时没有滚动文章');
+  assert.strictEqual(iconPendingArticle.navigations(), 0, '任务点未完成时不应跳节');
+
+  // 多子节点文章：第一个子节点已完成 → 直接下一节，绝不切第二个子节点
+  const twoCardCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const firstCardPreview = makePreviewArticleFixture(twoCardCtx);
+  const secondCardPreview = makePreviewArticleFixture(twoCardCtx);
+  const twoCardShell = makeArticleShellFixture(twoCardCtx, {
+    preview: firstCardPreview, completed: true,
+    preview2: secondCardPreview, completed2: false
+  });
+  twoCardCtx.__test.handleArticleReading([twoCardShell.doc, firstCardPreview.doc, secondCardPreview.doc]);
+  assert.strictEqual(twoCardShell.navigations(), 1, '第一个子节点已完成时没有进入下一节');
+  assert.strictEqual(secondCardPreview.pageScrolled(), 0, '第一个子节点完成后还去滚第二个子节点');
+
+  // 诊断命令本身不能抛异常（排错时用户会直接运行它）
+  const articleProbeCtx = createContext({ userscript: true, config, gmImpl() {} });
+  makePreviewArticleFixture(articleProbeCtx);
+  assert.strictEqual(typeof articleProbeCtx.articleProbe, 'function', 'articleProbe() 诊断命令没有注册');
+  assert.doesNotThrow(() => articleProbeCtx.articleProbe(), 'articleProbe() 诊断命令报错');
+
+  const finishedArticleCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const finishedArticle = makeArticleTaskFixture(finishedArticleCtx, { completed: true });
+  finishedArticleCtx.__test.autoAdvance([finishedArticle.doc]);
+  assert.strictEqual(finishedArticle.navigations(), 1, '打开时已完成的阅读任务没有跳节');
+  assert.strictEqual(finishedArticle.article.scrollTop, 0, '已完成文章不应滚动内部容器');
+  assert.strictEqual(finishedArticle.windowScrolls.length, 0, '已完成文章不应滚动页面');
+
+  const frameArticleCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const frameArticle = makeArticleTaskFixture(frameArticleCtx, { framed: true, completed: true });
+  assert(frameArticleCtx.__test.findCompletedArticleTask([frameArticle.doc]), '阅读 frame 完成标记未识别');
+  frameArticleCtx.__test.autoAdvance([frameArticle.doc]);
+  assert.strictEqual(frameArticle.navigations(), 1, '已完成阅读 frame 没有跳节');
+  assert.strictEqual(frameArticle.article.scrollTop, 0, '已完成阅读 frame 不应滚动');
+
+  const unfinishedFrameArticleCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const unfinishedFrameArticle = makeArticleTaskFixture(unfinishedFrameArticleCtx, { framed: true });
+  for (let i = 0; i < 8; i++) {
+    unfinishedFrameArticleCtx.__test.handleArticleReading([unfinishedFrameArticle.doc]);
+  }
+  assert.strictEqual(unfinishedFrameArticle.article.scrollTop, 900, '未完成阅读 frame 没有滚动正文');
+  assert.strictEqual(unfinishedFrameArticle.navigations(), 0, '未完成阅读 frame 被误跳过');
+
+  const pendingArticleWorkCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const pendingArticleWork = makeArticleTaskFixture(pendingArticleWorkCtx, {
+    framed: true, completed: true, pendingWork: true
+  });
+  assert.strictEqual(
+    pendingArticleWorkCtx.__test.findCompletedArticleTask([pendingArticleWork.doc]),
+    null,
+    '同节其他任务未完成时不应仅凭文章完成跳节'
+  );
+  pendingArticleWorkCtx.__test.autoAdvance([pendingArticleWork.doc]);
+  assert.strictEqual(pendingArticleWork.navigations(), 0);
+
+  const plainLongPageCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const plainLongPage = makeArticleTaskFixture(plainLongPageCtx, { semantic: false });
+  plainLongPageCtx.__test.handleArticleReading([plainLongPage.doc]);
+  assert.strictEqual(plainLongPage.article.scrollTop, 0, '普通长页面被误当文章滚动');
+  assert.strictEqual(plainLongPage.windowScrolls.length, 0);
+
+  const shortPageCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const shortPage = makeArticleTaskFixture(shortPageCtx, { short: true });
+  shortPageCtx.__test.handleArticleReading([shortPage.doc]);
+  assert.strictEqual(shortPage.article.scrollTop, 0, '短页面被误当长文章滚动');
+
+  const quizArticleCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const quizArticle = makeArticleTaskFixture(quizArticleCtx, { quiz: true, completed: true });
+  quizArticleCtx.__test.handleArticleReading([quizArticle.doc]);
+  assert.strictEqual(quizArticle.article.scrollTop, 0, '测验页被误当文章滚动');
+  assert.strictEqual(quizArticle.navigations(), 0, '测验页被文章模块误跳过');
+
+  const videoArticleCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const videoArticle = makeArticleTaskFixture(videoArticleCtx, { video: true, completed: true });
+  videoArticleCtx.__test.handleArticleReading([videoArticle.doc]);
+  assert.strictEqual(videoArticle.article.scrollTop, 0, '视频页被误当文章滚动');
+  assert.strictEqual(videoArticle.navigations(), 0, '视频页被文章模块误跳过');
+
+  const articleNoticeCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const articleNotice = makeArticleTaskFixture(articleNoticeCtx);
+  articleNoticeCtx.__test.onTopMessage({ data: { __autoStudy: 'articleDone' } });
+  assert.strictEqual(articleNotice.navigations(), 1, '跨域文章完成通知没有触发跳节');
+
   // 播放器接口只用于诊断，不能替代任务标记；否则平台未记账就会提前跳节。
   const statusSplitCtx = createContext({ userscript: true, config, gmImpl() {} });
   const statusSplit = makeVideoTaskFixture(statusSplitCtx, { completed: false });
@@ -980,15 +1460,10 @@ function makeFontQuestionFixture(ctx, mode) {
   assert.strictEqual(freshRulePage.navigations(), 0);
   assert.strictEqual(freshRuleCtx.__reloads, 0);
 
-  // 截图场景：提交后出现“未达到及格线，请重做”浮层，只有取消/确定，没有独立重做按钮。
-  // 失败浮层必须优先于“等待已完成”和单次刷新，点确定而不是取消，并清空旧答案。
+  // “未达到及格线，是否重新提交”：点取消关闭弹窗，再跳一次；绝不点确定重做。
   const failedModalCtx = createContext({ userscript: true, config, gmImpl() {} });
   const failedModalPage = makeQuizResultFixture(failedModalCtx, {
-    failed: false,
-    completed: false,
-    score: null,
-    redo: false,
-    failureModal: true
+    failed: false, completed: false, score: null, redo: false, failureModal: true
   });
   const failedModalState = failedModalCtx.__test.pageQuizState();
   failedModalState.doc = failedModalPage.doc;
@@ -997,49 +1472,65 @@ function makeFontQuestionFixture(ctx, mode) {
   failedModalState.waitingCompletion = true;
   failedModalCtx.__test.pageQuizCache().previousWrongAnswer = ['B'];
   const failedModalResult = failedModalCtx.__test.findRequiredPageQuizRetry([failedModalPage.doc]);
-  assert(failedModalResult && failedModalResult.modal, '未识别只有确定按钮的不及格浮层');
+  assert(failedModalResult && failedModalResult.modal, '未识别“是否重新提交”不及格浮层');
+  assert(failedModalResult.cancel, '没有找到浮窗取消按钮');
   assert.strictEqual(failedModalCtx.__test.handlePageQuiz([failedModalPage.doc]), true);
-  assert.strictEqual(failedModalPage.confirmClicks(), 1, '不及格浮层没有点击确定');
-  assert.strictEqual(failedModalPage.cancelClicks(), 0, '不及格浮层不应点击取消');
-  assert.strictEqual(failedModalPage.redoClicks(), 0, '该场景不存在独立重做按钮');
-  assert.strictEqual(failedModalPage.navigations(), 0, '不及格浮层出现时跳到了下一节');
-  assert.strictEqual(failedModalCtx.__reloads, 0, '失败浮层不应进入等待完成后的刷新');
-  assert.strictEqual(Object.keys(failedModalCtx.__test.pageQuizCache()).length, 0, '浮层重做仍复用了旧答案');
-  assert.strictEqual(failedModalCtx.__test.pageQuizState().submitted, false);
+  assert.strictEqual(failedModalPage.cancelClicks(), 1, '跳节前没有取消并关闭弹窗');
+  assert.strictEqual(failedModalPage.confirmClicks(), 0, '错误点击了确定重新提交');
+  assert.strictEqual(failedModalPage.redoClicks(), 0);
+  assert.strictEqual(failedModalPage.navigations(), 1, '关闭弹窗后没有直接跳节');
+  assert.strictEqual(failedModalCtx.__reloads, 0);
+  assert.strictEqual(Object.keys(failedModalCtx.__test.pageQuizCache()).length, 0);
   assert.strictEqual(failedModalCtx.__test.pageQuizState().waitingCompletion, false);
   failedModalCtx.__test.handlePageQuiz([failedModalPage.doc]);
-  assert.strictEqual(failedModalPage.confirmClicks(), 1, '旧失败浮层不应被重复点击');
+  assert.strictEqual(failedModalPage.cancelClicks(), 1, '旧弹窗被重复取消');
+  assert.strictEqual(failedModalPage.navigations(), 1, '旧结果被重复跳节');
+  const failedModalNodes = failedModalPage.doc.querySelectorAll('#coursetree .posCatalog_select');
+  failedModalNodes[0].className = 'posCatalog_select';
+  failedModalNodes[1].className = 'posCatalog_select posCatalog_active';
+  assert.strictEqual(failedModalCtx.__test.updatePageQuizEscape(), false, '弹窗已关闭却没有恢复新章节');
 
-  // 必须及格的测验：无分数 + 不及格 + 重做，应清空缓存并重做，不能跳节。
+  // 目录变了但旧弹窗仍在：冻结新章节，不连续跳；8 秒后安全停止。
+  const lingeringCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const lingeringPage = makeQuizResultFixture(lingeringCtx, {
+    failed: false, completed: false, score: null, redo: false,
+    failureModal: true, closeModalOnCancel: false
+  });
+  lingeringCtx.__test.handlePageQuiz([lingeringPage.doc]);
+  assert.strictEqual(lingeringPage.cancelClicks(), 1);
+  assert.strictEqual(lingeringPage.navigations(), 1);
+  const lingeringNodes = lingeringPage.doc.querySelectorAll('#coursetree .posCatalog_select');
+  lingeringNodes[0].className = 'posCatalog_select';
+  lingeringNodes[1].className = 'posCatalog_select posCatalog_active';
+  assert.strictEqual(lingeringCtx.__test.updatePageQuizEscape(), true, '残留弹窗没有阻止新章节处理');
+  assert.strictEqual(lingeringPage.navigations(), 1, '残留弹窗导致连续跳章');
+  lingeringCtx.__test.pageQuizEscape().since -= 8001;
+  lingeringCtx.__test.updatePageQuizEscape();
+  assert.strictEqual(lingeringCtx.__autoStudyTimer, null, '残留弹窗一直存在时没有停止');
+  assert.strictEqual(lingeringCtx.__test.AI.enabled, false);
+
+  // 非弹窗的未通过结果也只跳一次，不点重做、不再 AI 回退。
   const retryCtx = createContext({ userscript: true, config, gmImpl() {} });
   const retryPage = makeQuizResultFixture(retryCtx, { failed: true, completed: false, score: null });
   assert(retryCtx.__test.findRequiredPageQuizRetry([retryPage.doc]), '未识别必须重做结果页');
-  assert.strictEqual(retryCtx.__test.findCompletedPageQuiz([retryPage.doc]), null, '不及格页不能算已完成');
   retryCtx.__test.pageQuizCache().previousWrongAnswer = ['A'];
-  assert.strictEqual(retryCtx.__test.handlePageQuiz([retryPage.doc]), true);
-  assert.strictEqual(retryPage.redoClicks(), 1, '不及格时没有点击重做');
-  assert.strictEqual(retryPage.navigations(), 0, '不及格时跳到了下一节');
-  assert.strictEqual(retryCtx.__reloads, 0, '不及格重试不应先刷新页面');
-  assert.strictEqual(Object.keys(retryCtx.__test.pageQuizCache()).length, 0, '重做仍在复用上一轮答案缓存');
-  assert.strictEqual(retryCtx.__test.pageQuizState().needAdvance, false);
   retryCtx.__test.handlePageQuiz([retryPage.doc]);
-  assert.strictEqual(retryPage.redoClicks(), 1, '旧重做结果 DOM 不应被重复点击');
-  const retryPrompt = retryCtx.__test.buildPageAskPrompt(q, 'answer');
-  assert(retryPrompt.includes('第 1 次重做'), '重做提示没有要求 AI 重新独立审题');
-  const secondRetryState = retryCtx.__test.pageQuizState();
-  secondRetryState.submitted = true;
-  secondRetryState.submittedAt = Date.now() - 20000;
-  secondRetryState.retryHandled = false;
-  secondRetryState.retryKey = '';
+  assert.strictEqual(retryPage.redoClicks(), 0, '一次未通过后仍点击了重做');
+  assert.strictEqual(retryPage.navigations(), 1, '一次未通过后没有直接跳节');
+  assert.strictEqual(retryCtx.__test.pageQuizNoFeedbackRetries(), 0, '仍然进行了无反馈 AI 回退');
+  assert.strictEqual(Object.keys(retryCtx.__test.pageQuizCache()).length, 0);
   retryCtx.__test.handlePageQuiz([retryPage.doc]);
-  assert.strictEqual(retryPage.redoClicks(), 1, '没有逐题反馈时第二次失败必须停止，不能无限 AI 重做');
-  assert.strictEqual(retryCtx.__test.pageQuizNoFeedbackRetries(), 1);
-  assert.strictEqual(retryPage.navigations(), 0);
+  assert.strictEqual(retryPage.navigations(), 1, '同一失败结果被重复跳节');
+  retryCtx.__test.pageQuizEscape().since -= 8001;
+  retryCtx.__test.updatePageQuizEscape();
+  assert.strictEqual(retryCtx.__autoStudyTimer, null, '锁章时没有总停止');
+  assert.strictEqual(retryCtx.__test.AI.enabled, false);
 
   // 已有成绩但任务完成标记延迟：等待 -> 仅刷新一次 -> 标记出现后跳节，不点可选重做。
   const delayedQuizCtx = createContext({ userscript: true, config, gmImpl() {} });
   const delayedQuiz = makeQuizResultFixture(delayedQuizCtx, { score: 100, completed: false });
   assert.strictEqual(delayedQuizCtx.__test.findCompletedPageQuiz([delayedQuiz.doc]), null, '只有分数不能当成完成');
+  delayedQuizCtx.__test.recordPageQuizSubmission();  // 已提交一次也不能把正常的成绩延迟误判为失败
   delayedQuizCtx.__test.handlePageQuiz([delayedQuiz.doc]);
   assert.strictEqual(delayedQuiz.navigations(), 0, '完成标记未出现就跳节');
   assert.strictEqual(delayedQuiz.redoClicks(), 0, '公布分数页不应消耗可选重做');
@@ -1258,62 +1749,25 @@ function makeFontQuestionFixture(ctx, mode) {
   const crossParsed = crossModalCtx.__test.parsePageQuestions([crossQuestionCtx.document]);
   assert.strictEqual(crossParsed.length, 1, '跨框架测试题没有被整页解析器识别');
   assert.strictEqual(crossModalCtx.__test.readPageQuestionFeedback(crossParsed[0]), 'wrong');
-  const crossKey = crossModalCtx.__test.pageQuizQuestionKey(crossParsed[0]);
-  crossModalCtx.__test.pageQuizCache()[crossKey] = ['A'];
-  let crossRedoClicks = 0;
-  const crossRedo = makeElement(crossModalCtx.document, '确定');
-  crossRedo.click = function () { crossRedoClicks++; };
-  crossModalCtx.__test.handleRequiredPageQuizRetry({
-    doc: crossModalCtx.document, redo: crossRedo, key: 'cross-frame-modal', reason: '未达到及格要求', modal: true
-  }, [crossModalCtx.document, crossQuestionCtx.document]);
-  assert.strictEqual(crossRedoClicks, 1);
-  assert.deepStrictEqual(Array.from(crossModalCtx.__test.pageQuizCache()[crossKey] || []), ['B'],
-    '弹窗与题目分离时清空候选并退回 AI，没有生成 B');
-  assert.strictEqual(crossModalCtx.__test.pageQuizNoFeedbackRetries(), 0,
-    '成功读取逐题反馈时不应消耗无反馈重试额度');
+  // 跨框架反馈只保留识别测试；实际失败流程不再根据反馈穷举或 AI 重做。
 
-  // 完全读不到逐题反馈时最多 AI 回退一次；第二次失败必须停，不能反复提交同一答案。
-  const loopGuardCtx = createContext({ userscript: true, config, gmImpl() {} });
-  let loopGuardClicks = 0;
-  const loopGuardRedo = makeElement(loopGuardCtx.document, '确定');
-  loopGuardRedo.click = function () { loopGuardClicks++; };
-  function fireNoFeedbackFailure() {
-    const state = loopGuardCtx.__test.pageQuizState();
-    state.retryHandled = false;
-    state.retryKey = '';
-    loopGuardCtx.__test.handleRequiredPageQuizRetry({
-      doc: loopGuardCtx.document, redo: loopGuardRedo, key: 'same-overall-failure',
-      reason: '未达到及格要求', modal: true
-    }, [loopGuardCtx.document]);
-  }
-  fireNoFeedbackFailure();
-  assert.strictEqual(loopGuardClicks, 1, '第一次无反馈失败没有执行唯一一次回退');
-  assert.strictEqual(loopGuardCtx.__test.pageQuizNoFeedbackRetries(), 1);
-  fireNoFeedbackFailure();
-  fireNoFeedbackFailure();
-  assert.strictEqual(loopGuardClicks, 1, '无逐题反馈时陷入无限 AI 重做');
-  assert.strictEqual(loopGuardCtx.__test.pageQuizNoFeedbackRetries(), 1,
-    '被阻止的重试不应继续增加计数');
-
-  // 七次实际提交硬上限：第 6 次之后只能记录到第 7 次，并从本地存储恢复。
+  // 每份测验最多实际提交一次，并从本地存储恢复。
   const capCtx = createContext({ userscript: true, config, gmImpl() {} });
   const capPage = makeQuizResultFixture(capCtx, { failed: true, completed: false, score: null });
-  const capQuestion = makeFeedbackQuestion(capCtx, { text: '【单选题】七次提交上限测试题干' });
+  const capQuestion = makeFeedbackQuestion(capCtx, { text: '【单选题】单次提交上限测试题干' });
   const capSig = capCtx.__test.makePageQuizSignature([capQuestion]);
   capCtx.__test.syncPageQuizGuard(capSig);
-  for (let i = 0; i < 6; i++) capCtx.__test.recordPageQuizSubmission();
-  assert.strictEqual(capCtx.__test.pageQuizGuard().count, 6);
   capCtx.__test.recordPageQuizSubmission();
   capCtx.__test.recordPageQuizSubmission();
-  assert.strictEqual(capCtx.__test.pageQuizGuard().count, 7, '提交次数没有封顶在 7');
+  assert.strictEqual(capCtx.__test.pageQuizGuard().count, 1, '提交次数没有封顶在 1');
   const savedCap = JSON.parse(capCtx.localStorage.getItem('autoStudy:quizGuard:v1.1'));
-  assert.strictEqual(savedCap.count, 7, '第 7 次提交没有写入本地存储');
+  assert.strictEqual(savedCap.count, 1, '单次提交没有写入本地存储');
   capCtx.__test.pageQuizGuard().sig = '';       // 模拟刷新后的空内存状态
   capCtx.__test.syncPageQuizGuard(capSig);
-  assert.strictEqual(capCtx.__test.pageQuizGuard().count, 7, '刷新后没有恢复提交次数');
+  assert.strictEqual(capCtx.__test.pageQuizGuard().count, 1, '刷新后没有恢复提交次数');
 
-  // 达到上限后只尝试一次下一节；目录变化后恢复新任务，不能全局关掉 AI。
-  capCtx.__test.abandonCurrentPageQuiz('测试七次上限');
+  // 一次未通过后只尝试一次下一节；目录变化后恢复新任务，不能全局关掉 AI。
+  capCtx.__test.abandonCurrentPageQuiz('测试单次上限');
   capCtx.__test.abandonCurrentPageQuiz('重复退出不应重复跳节');
   assert.strictEqual(capPage.navigations(), 1, '达到上限后重复点击了下一节');
   assert(capCtx.__test.pageQuizEscape(), '没有记录跳节来源');
@@ -1329,23 +1783,23 @@ function makeFontQuestionFixture(ctx, mode) {
   assert.strictEqual(capCtx.__test.pageQuizGuard().abandoned, false, '新小节仍继承旧测验放弃状态');
   assert.strictEqual(capCtx.__test.pageQuizGuard().count, 0, '新小节仍继承旧提交次数');
 
-  // 第七次如果实际通过，完成标记优先，清除旧次数而不是进入放弃流程。
-  const seventhPassCtx = createContext({ userscript: true, config, gmImpl() {} });
-  const seventhPassPage = makeQuizResultFixture(seventhPassCtx, { score: 100, completed: true });
-  const seventhPassQuestion = makeFeedbackQuestion(seventhPassCtx, { text: '【单选题】第七次正常通过测试题干' });
-  seventhPassCtx.__test.syncPageQuizGuard(seventhPassCtx.__test.makePageQuizSignature([seventhPassQuestion]));
-  for (let i = 0; i < 7; i++) seventhPassCtx.__test.recordPageQuizSubmission();
-  seventhPassCtx.__test.handlePageQuiz([seventhPassPage.doc]);
-  assert.strictEqual(seventhPassCtx.__test.pageQuizGuard().count, 0, '正常完成后没有清除提交守护');
-  assert.strictEqual(seventhPassCtx.__test.pageQuizGuard().abandoned, false, '第七次通过被误判为放弃');
-  assert.strictEqual(seventhPassCtx.__test.AI.enabled, true, '正常完成错误关闭了后续 AI');
+  // 第一次如果实际通过，完成标记优先，清除旧次数而不是进入放弃流程。
+  const firstPassCtx = createContext({ userscript: true, config, gmImpl() {} });
+  const firstPassPage = makeQuizResultFixture(firstPassCtx, { score: 100, completed: true });
+  const firstPassQuestion = makeFeedbackQuestion(firstPassCtx, { text: '【单选题】第一次正常通过测试题干' });
+  firstPassCtx.__test.syncPageQuizGuard(firstPassCtx.__test.makePageQuizSignature([firstPassQuestion]));
+  firstPassCtx.__test.recordPageQuizSubmission();
+  firstPassCtx.__test.handlePageQuiz([firstPassPage.doc]);
+  assert.strictEqual(firstPassCtx.__test.pageQuizGuard().count, 0, '正常完成后没有清除提交守护');
+  assert.strictEqual(firstPassCtx.__test.pageQuizGuard().abandoned, false, '第一次通过被误判为放弃');
+  assert.strictEqual(firstPassCtx.__test.AI.enabled, true, '正常完成错误关闭了后续 AI');
 
   // 平台锁章：8 秒目录不变就总停止，整段时间只允许一次跳节点击。
   const lockedCtx = createContext({ userscript: true, config, gmImpl() {} });
   const lockedPage = makeQuizResultFixture(lockedCtx, { failed: true, completed: false, score: null });
   const lockedQuestion = makeFeedbackQuestion(lockedCtx, { text: '【单选题】平台锁章退出测试题干' });
   lockedCtx.__test.syncPageQuizGuard(lockedCtx.__test.makePageQuizSignature([lockedQuestion]));
-  for (let i = 0; i < 7; i++) lockedCtx.__test.recordPageQuizSubmission();
+  lockedCtx.__test.recordPageQuizSubmission();
   lockedCtx.__test.abandonCurrentPageQuiz('测试锁章');
   assert.strictEqual(lockedCtx.__test.updatePageQuizEscape(), true);
   lockedCtx.__test.abandonCurrentPageQuiz('锁章期间不得再次跳节');
@@ -1356,7 +1810,7 @@ function makeFontQuestionFixture(ctx, mode) {
   assert.strictEqual(lockedCtx.__test.AI.enabled, false, '锁章停止后仍可发起 AI 请求');
   assert.strictEqual(lockedPage.navigations(), 1, '锁章停止前后发生了多次跳节');
 
-  // 最后一节达到上限直接停止，不能伪造完成或调用下一节。
+  // 最后一节未通过直接停止，不能伪造完成或调用下一节。
   const cappedLastCtx = createContext({ userscript: true, config, gmImpl() {} });
   const cappedLastPage = makeQuizResultFixture(cappedLastCtx, { failed: true, completed: false, score: null });
   const cappedLastActive = cappedLastPage.doc.querySelector('#coursetree .posCatalog_active');
@@ -1365,12 +1819,12 @@ function makeFontQuestionFixture(ctx, mode) {
     if (selector === '#coursetree .posCatalog_select') return [cappedLastActive];
     return originalCappedLastAll(selector);
   };
-  const cappedLastQuestion = makeFeedbackQuestion(cappedLastCtx, { text: '【单选题】末章七次上限测试题干' });
+  const cappedLastQuestion = makeFeedbackQuestion(cappedLastCtx, { text: '【单选题】末章单次失败测试题干' });
   cappedLastCtx.__test.syncPageQuizGuard(cappedLastCtx.__test.makePageQuizSignature([cappedLastQuestion]));
-  for (let i = 0; i < 7; i++) cappedLastCtx.__test.recordPageQuizSubmission();
-  cappedLastCtx.__test.abandonCurrentPageQuiz('测试末章上限');
-  assert.strictEqual(cappedLastPage.navigations(), 0, '末章达到上限后仍尝试下一节');
-  assert.strictEqual(cappedLastCtx.__autoStudyTimer, null, '末章达到上限后没有停止');
+  cappedLastCtx.__test.recordPageQuizSubmission();
+  cappedLastCtx.__test.abandonCurrentPageQuiz('测试末章单次失败');
+  assert.strictEqual(cappedLastPage.navigations(), 0, '末章未通过后仍尝试下一节');
+  assert.strictEqual(cappedLastCtx.__autoStudyTimer, null, '末章未通过后没有停止');
   assert.strictEqual(cappedLastCtx.__test.AI.enabled, false);
 
   // 结果长期不明确也必须退出等待，不能整夜刷新或重试。
@@ -1385,9 +1839,13 @@ function makeFontQuestionFixture(ctx, mode) {
   unclearState.waitingCompletion = true;
   unclearState.submittedAt = Date.now() - 91000;
   unclearCtx.__test.handlePageQuiz([unclearPage.doc]);
-  assert.strictEqual(unclearCtx.__autoStudyTimer, null, '提交结果 90 秒不明确时没有停止');
+  assert.strictEqual(unclearPage.navigations(), 1, '单次提交结果超时后没有尝试跳节');
+  unclearCtx.__test.handlePageQuiz([unclearPage.doc]);
+  assert.strictEqual(unclearPage.navigations(), 1, '结果超时退出重复跳节');
+  unclearCtx.__test.pageQuizEscape().since -= 8001;
+  unclearCtx.__test.updatePageQuizEscape();
+  assert.strictEqual(unclearCtx.__autoStudyTimer, null, '跳节被锁时没有停止');
   assert.strictEqual(unclearCtx.__test.AI.enabled, false);
-  assert.strictEqual(unclearPage.navigations(), 0, '结果不明确时错误跳节');
 
   // 手动停止也必须阻断 AI 排队和后续自动跳节。
   const manualStopCtx = createContext({ userscript: true, config, gmImpl() {} });
@@ -1577,7 +2035,7 @@ function makeFontQuestionFixture(ctx, mode) {
   assert.deepStrictEqual(Array.from(consoleAnswer), ['C'], '控制台 fetch 通道答题失败');
   assert.strictEqual(fetchCalled, true, '控制台版没有回退到 fetch');
 
-  console.log('PASS: font restore/no DOM mutation, missing-font/missing-glyph/ambiguous-font zero requests, model-garble circuit breaker/no review fallback, plain-question regression, player-status JSONP/XHR/fetch stale-label guards, completed-video advance/no replay, multi-video guards, video-before-quiz ordering, per-question text and empty marking_cuo/marking_dui icon feedback parsing, submitted-answer text/aria-checked recovery, duplicate-option deduplication, correct-answer retention, single-choice and all 15 four-option multi-choice candidates, candidate-exhaustion blocks, multi-choice old-answer clearing, cross-frame feedback retry, no-feedback AI retry loop guard, seven-submission cap/persistence/seventh-pass priority, single locked-section escape/8-second stop, 90-second unclear-result stop, manual-stop AI queue cutoff, last-section stop/next-card guards, unsubmitted-rule/no-redo guard, failed-modal confirm/retry without completion wait, required-retry/cache-reset vs optional-redo, quiz completion-marker wait/single-refresh with and without score, completed-quiz advance/no redo/no AI, unfinished-task guards, empty-page advance, playback menu/throttle/fallback, GM/fetch AI and answer parsing');
+  console.log('PASS: font restore/no DOM mutation, missing-font/missing-glyph/ambiguous-font zero requests, model-garble circuit breaker/no review fallback, plain-question regression, completed-section skip (tree/aria-label task icons), reading-page <html> scroll (no course-tree scroll), multi-article scroll, first-subnode-completes-section (no second-card scroll), post-scroll completion detection, articleProbe smoke, player-status stale-label guards, completed-video advance/no replay, multi-video guards, video-before-quiz ordering, per-question feedback parsing, submitted-answer recovery, duplicate-option deduplication, candidate helper regression, multi-choice old-answer clearing, cross-frame feedback parsing, single-submission cap/persistence/first-pass priority, failure-modal cancel-before-single-skip, lingering-modal cross-section freeze, no AI retry/resubmit after first failure, single locked-section escape/8-second stop, 90-second unclear-result escape, manual-stop AI queue cutoff, last-section stop/next-card guards, unsubmitted-rule guard, scored-completion delay after one submission, completed-quiz advance/no redo/no AI, unfinished-task guards, empty-page advance, playback menu/throttle/fallback, GM/fetch AI and answer parsing');
 })().catch(err => {
   console.error(err);
   process.exitCode = 1;

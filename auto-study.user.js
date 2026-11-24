@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         超星学习通 · 全自动刷课
 // @namespace    auto-study
-// @version      1.1
-// @description  自定义倍速 / 静音 / 视频弹题 / 章节测验 / 播完自动跳下一节 / 目录自动进入；换页刷新自动续跑
+// @version      1.4
+// @description  自定义倍速 / 静音 / 视频弹题 / 章节测验 / 文章自动滚动 / 播完自动跳下一节 / 目录自动进入；换页刷新自动续跑
 // @author       auto-study
 // @match        *://*.chaoxing.com/*
 // @match        *://*.xuexitong.com/*
 // @match        *://*.nbdxt.com/*
+// @match        *://*.cldisk.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
@@ -21137,7 +21138,7 @@ const CX_FONT_TABLE = Object.freeze({
       box.style.cssText = 'background:#fff;color:#222;border-radius:12px;padding:20px 22px;' +
         'min-width:440px;max-width:92vw;max-height:92vh;overflow:auto;box-shadow:0 12px 40px rgba(0,0,0,.3)';
       box.innerHTML =
-        '<h3 style="margin:0 0 14px;font-size:16px">自动刷课 · 设置（v1.1）</h3>' +
+        '<h3 style="margin:0 0 14px;font-size:16px">自动刷课 · 设置（v1.4）</h3>' +
         '<div style="margin-bottom:10px"><div style="margin-bottom:4px">播放倍速</div>' +
         '<input id="__asRate" type="number" min="0.25" max="16" step="0.25" style="width:100%;padding:7px;box-sizing:border-box;border:1px solid #ccd;border-radius:6px">' +
         '<div style="font-size:12px;color:#888;margin-top:4px">可输入 0.25～16，如 1.5、2、3、5、10；建议优先用 2，高倍速需课程播放器支持。</div></div>' +
@@ -23323,6 +23324,135 @@ const CX_FONT_TABLE = Object.freeze({
     return true;
   }
 
+  // ---- “本节是否已完成”：优先级从高到低 ----
+  //  1) 页面头部「已完成任务点: X/Y」——整节进度的权威值；
+  //  2) 任务点图标 aria-label="任务点已完成"/"任务点未完成"——完成状态只看 aria-label，
+  //     ans-job-icon-clear 这类是样式类，跟完成无关（原版只认 .ans-job-finished 会漏判）；
+  //  3) 目录小节的完成标记——原版 autoEnterCourse 的线索（complete/finish/jobFinish），
+  //     以及学习通目录里的 .catalog_points_yi（已完成）/ .jobUnfinishCount（剩余任务点）。
+  var SECTION_DONE_SELECTOR = '[class*="complete"],[class*="Complete"],[class*="finish"],[class*="Finish"],' +
+    '[class*="jobFinish"],[class*="jobfinish"],[class*="JobFinish"],[class*="jobfinished"],.catalog_points_yi';
+  var SECTION_DONE_CLASS_RE = /(?:^|[\s_-])(?:complete|completed|finish|finished|jobfinish|jobfinished)(?:$|[\s_-])/i;
+  var SECTION_UNFINISH_SELECTOR = '.jobUnfinishCount,.catalog_points_wei';
+  var SECTION_TASK_COUNTER_RE = /已完成任务点\s*[:：]?\s*(\d+)\s*[\/／]\s*(\d+)/;
+
+  function activeSectionLeaf() {
+    if (!IS_TOP) return null;
+    var node = null;
+    try { node = window.top.document.querySelector('#coursetree .posCatalog_active'); } catch (e) { return null; }
+    if (!node) return null;
+    // 章节点（id 不是 cur 小节）不能按“小节完成”跳过，否则会漏掉整章的小节
+    if (!/^cur\d+/.test(node.id || '')) return null;
+    return node;
+  }
+
+  function sectionNodeDone(node) {
+    if (!node) return null;
+    // 目录上明确标了“剩余任务点”的小节一定还没完成（数量为 0 的不算）
+    try {
+      var unfinish = node.querySelector(SECTION_UNFINISH_SELECTOR);
+      if (unfinish) {
+        var left = parseInt(tightText(unfinish), 10);
+        if (!isFinite(left) || left > 0) return null;
+      }
+    } catch (e) {}
+    var c = node.className;
+    var cls = typeof c === 'string' ? c : (c && c.baseVal) || '';
+    if (SECTION_DONE_CLASS_RE.test(cls)) return node;
+    try {
+      var hit = node.querySelector(SECTION_DONE_SELECTOR);
+      if (hit) return hit;
+    } catch (e) {}
+    // 有些课程在目录里直接放一个“已完成/已学完”或对号小标签
+    try {
+      var tags = node.querySelectorAll('span,em,i,b');
+      for (var i = 0; i < tags.length && i < 30; i++) {
+        var t = tightText(tags[i]);
+        if (t === '已完成' || t === '已学完' || t === '✔' || t === '✓') return tags[i];
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  // 任务点完成状态（aria-label）和整节进度（已完成任务点 X/Y）。
+  function readSectionTaskState(docs) {
+    var state = { icons: { found: 0, done: 0, pending: 0 }, counter: null };
+    for (var d = 0; d < (docs || []).length; d++) {
+      var doc = docs[d];
+      var icons;
+      try { icons = doc.querySelectorAll('[class*="ans-job-icon"]'); } catch (e) { icons = []; }
+      for (var i = 0; i < icons.length && i < 200; i++) {
+        var icon = icons[i];
+        if (!visible(icon)) continue;
+        var label = '';
+        try { label = String(icon.getAttribute('aria-label') || icon.getAttribute('title') || ''); } catch (e) {}
+        if (label.indexOf('任务点') < 0) continue;
+        state.icons.found++;
+        if (label.indexOf('未完成') >= 0) state.icons.pending++;
+        else if (label.indexOf('已完成') >= 0) state.icons.done++;
+      }
+      if (state.counter) continue;
+      var text = '';
+      try { text = String(doc.body && doc.body.textContent || ''); } catch (e) {}
+      var m = SECTION_TASK_COUNTER_RE.exec(text);
+      if (m) {
+        var done = parseInt(m[1], 10), total = parseInt(m[2], 10);
+        if (isFinite(done) && isFinite(total)) state.counter = { done: done, total: total };
+      }
+    }
+    return state;
+  }
+
+  // 整节完成：只认“已完成任务点 X/Y”（图标只能说明当前子节点）。
+  function sectionTaskStateComplete(state) {
+    if (!state || !state.counter) return false;
+    return state.counter.total > 0 && state.counter.done >= state.counter.total;
+  }
+
+  // 当前子节点的任务点都已完成（图标全绿）。
+  function tabTaskStateComplete(state) {
+    return !!(state && state.icons.found > 0 &&
+      state.icons.pending === 0 && state.icons.done === state.icons.found);
+  }
+
+  function activeSectionDone(docs) {
+    if (!IS_TOP) return null;
+    // 目录里没定位到当前小节（例如课程目录页）就不判断完成，免得误跳
+    var leaf = activeSectionLeaf();
+    if (!leaf) return null;
+    var state = null;
+    try { state = readSectionTaskState(docs || []); } catch (e) {}
+    if (state && (sectionTaskStateComplete(state) ||
+      (!state.counter && tabTaskStateComplete(state)))) {
+      return { leaf: leaf, marker: null, state: state, source: 'tasks' };
+    }
+    if (!leaf) return null;
+    var marker = sectionNodeDone(leaf);
+    return marker ? { leaf: leaf, marker: marker, state: state, source: 'tree' } : null;
+  }
+
+  var completedSectionState = { key: '', at: 0 };
+  function advanceCompletedSection(info) {
+    if (!info) return false;
+    var leaf = info.leaf;
+    var key = 'section:' + (currentActiveId() || (leaf && leaf.id) || '');
+    var now = Date.now();
+    if (completedSectionState.key === key && now - completedSectionState.at < 8000) return true;
+    completedSectionState.key = key;
+    completedSectionState.at = now;
+    resetArticleScrollProgress();
+    log((info.source === 'tasks' ? '本节任务点已全部完成' : '目录显示本节已完成') +
+      '：跳过本节，不再重复刷');
+    if (isLastSection()) { stopCourseAtEnd(); return true; }
+    if (tryNextSection()) {
+      advanceCooldown = 2;
+      lastActiveId = '';
+      return true;
+    }
+    log('⚠️ 本节已完成，但没找到下一节入口，请手动点一下下一节');
+    return true;
+  }
+
   var advanceCooldown = 0;
   var lastActiveId = '';
   var emptySectionState = { id: '', since: 0, warned: false };
@@ -23411,9 +23541,697 @@ const CX_FONT_TABLE = Object.freeze({
     return false;
   }
 
+  // ---- 长文章阅读：滚动只负责触发平台上报，完成标记才负责跳节 ----
+  // v1.3：文档阅读页（云盘 PDF/文档预览）真正的滚动条在阅读页自己的 <html> 上
+  //   <html style="font-size:118.267px">，正文是 .fileBox > ul > li#anchorN > img 分页图片，
+  //   页面自己监听 window.scroll，滚到底才给父页面 postMessage({isFinished:1})。
+  //   所以必须在阅读页文档里滚；顶层课程页的目录树、内容面板都不是阅读滚动条。
+  var ARTICLE_SEMANTIC_SELECTOR = 'article,main,[class*="article" i],[class*="read" i],' +
+    '[class*="content" i],[id*="article" i],[id*="read" i],[id*="content" i]';
+  var ARTICLE_BLOCK_SELECTOR = 'article,main,section,div';
+  var ARTICLE_MARKER_SELECTOR = '.ans-job-finished,.ans-jobfinished,div,p,span,section,article';
+  var ARTICLE_PREVIEW_SELECTOR = '.fileBox li[id^="anchor"] img';
+  var ARTICLE_SCROLL_STEP_RATIO = 0.85;   // 每步滚动的视口比例，一屏多一点，像人往下翻
+  var ARTICLE_SCROLL_STEPS_PER_TICK = 3;  // 每轮最多推进几屏，长文档不用等太久
+  var ARTICLE_SCROLL_MAX_STEPS = 400;     // 单个小节最多滚多少步，防死循环
+  var ARTICLE_CARD_WAIT_MS = 8000;        // 读完了但整节未完成，等多久才考虑切下一个子节点
+  var ARTICLE_SETTLE_MS = 6000;           // 一篇滚到底后先等平台打标的时间
+
+  function isArticleFrameType(type) {
+    return /^(?:read|reading|article|document|insertdoc)(?:module|reader)?$/i.test(String(type || ''));
+  }
+
+  function articleDimension(value) {
+    var n = Number(value);
+    return isFinite(n) && n > 0 ? n : 0;
+  }
+
+  function articleDocumentKey(doc) {
+    var href = '';
+    try { href = String(doc.defaultView.location.href || ''); } catch (e) {}
+    return (currentActiveId() + '|' + href).slice(0, 500);
+  }
+
+  function articleDocumentFrameType(doc) {
+    var win;
+    try { win = doc.defaultView; } catch (e) { return ''; }
+    for (var depth = 0; win && depth < 4; depth++) {
+      var frame = null;
+      try { frame = win.frameElement; } catch (e) { break; }
+      if (!frame) break;
+      var type = taskFrameType(frame);
+      if (type) return type;
+      try {
+        if (win.parent === win) break;
+        win = win.parent;
+      } catch (e) { break; }
+    }
+    return '';
+  }
+
+  function articleIsTopDocument(doc) {
+    try { return doc === window.top.document; } catch (e) { return IS_TOP; }
+  }
+
+  function articleHasModuleFrames(doc) {
+    var frames;
+    try { frames = doc.querySelectorAll('iframe[src*="/ananas/modules/"]'); } catch (e) { return false; }
+    for (var i = 0; i < frames.length; i++) if (visible(frames[i])) return true;
+    return false;
+  }
+
+  // 云盘文档阅读页：正文是分页图片，滚动条在 <html> 上，靠“滚到底”通知父页面完成任务。
+  function articleIsPreviewDocument(doc) {
+    if (!doc || !doc.querySelectorAll) return false;
+    try {
+      if (doc.querySelectorAll('.fileBox').length) return true;
+      if (doc.querySelectorAll(ARTICLE_PREVIEW_SELECTOR).length) return true;
+      if (doc.querySelectorAll('.fileBox img').length) return true;
+      var anchors = doc.querySelectorAll('li[id^="anchor"]').length +
+        doc.querySelectorAll('img[src*="/thumb/"]').length;
+      if (anchors && (doc.querySelectorAll('#zoomSlider').length ||
+        doc.querySelectorAll('.zoom-slider').length ||
+        doc.querySelectorAll('.pageNum').length ||
+        doc.querySelectorAll('.preview-dialog__footer').length)) return true;
+      if (anchors && typeof doc.querySelector === 'function' && doc.querySelector('#markDataStr')) return true;
+      return false;
+    } catch (e) { return false; }
+  }
+
+  // 阅读页 iframe 的 URL 特征：跨域读不到内容时靠它识别“这是阅读/文档任务”。
+  function articleFrameLooksLikeReader(frame) {
+    var src = '';
+    try { src = String(frame.getAttribute('src') || frame.src || ''); } catch (e) {}
+    return /pan-yz|pan\.chaoxing|cldisk|\/preview\/|objectshowpreview|insertdoc|\/read\//i.test(src);
+  }
+
+  function articleFrameDocument(frame) {
+    try {
+      return frame.contentDocument || (frame.contentWindow && frame.contentWindow.document) || null;
+    } catch (e) { return null; }
+  }
+
+  // 阅读页 iframe 是否还显示着；跨域父页面拿不到 frameElement，只能按“可见”处理。
+  function articleDocumentVisible(doc) {
+    try {
+      var win = doc.defaultView;
+      var frame = win && win.frameElement;
+      if (frame) return visible(frame);
+    } catch (e) {}
+    return true;
+  }
+
+  function articleDocumentIsReadable(doc, force) {
+    if (!doc || !doc.body) return false;
+    var bodyText = '';
+    try { bodyText = String(doc.body.textContent || ''); } catch (e) { return false; }
+    if (/【(?:单选题|多选题|判断题)】/.test(bodyText)) return false;
+    try {
+      var videos = doc.querySelectorAll('video');
+      for (var v = 0; v < videos.length; v++) if (visible(videos[v])) return false;
+    } catch (e) {}
+
+    // 文档阅读页优先：分页图片没有正文文字，不能按文字长度判断。
+    if (articleIsPreviewDocument(doc)) return true;
+    var frameType = articleDocumentFrameType(doc);
+    if (frameType && !isArticleFrameType(frameType)) return false;
+    var readingFrame = force || isArticleFrameType(frameType);
+    if (tightText(doc.body).length < 80) return false;
+
+    var semantic = false;
+    try {
+      var nodes = doc.querySelectorAll(ARTICLE_SEMANTIC_SELECTOR);
+      for (var i = 0; i < nodes.length; i++) {
+        if (visible(nodes[i]) && tightText(nodes[i]).length >= 80) { semantic = true; break; }
+      }
+    } catch (e) {}
+    // 顶层课程页必须出现文章语义容器；阅读 frame 内可用长正文兜底。
+    if (!semantic && !readingFrame && articleIsTopDocument(doc)) return false;
+    return semantic || readingFrame || tightText(doc.body).length >= 120;
+  }
+
+  // 文档级滚动面：阅读页的滚动条在 <html>（documentElement / scrollingElement）上。
+  function articleDocumentSurface(doc) {
+    var win = null, de = null, body = null, root = null;
+    try { win = doc.defaultView || null; } catch (e) {}
+    try { de = doc.documentElement || null; } catch (e) {}
+    try { body = doc.body || null; } catch (e) {}
+    try { root = doc.scrollingElement || de || body; } catch (e) { root = de || body; }
+    var height = Math.max(
+      articleDimension(root && root.scrollHeight),
+      articleDimension(de && de.scrollHeight),
+      articleDimension(body && body.scrollHeight)
+    );
+    var viewport = articleDimension(win && win.innerHeight) ||
+      articleDimension(de && de.clientHeight) || articleDimension(body && body.clientHeight);
+    if (!root || !viewport || height <= viewport + 2) return null;
+    var top = articleDimension(win && win.pageYOffset);
+    if (!top) {
+      top = Math.max(
+        articleDimension(de && de.scrollTop),
+        articleDimension(body && body.scrollTop)
+      );
+    }
+    return {
+      doc: doc, win: win, de: de, body: body, root: root, kind: 'document',
+      height: height, viewport: viewport, top: top,
+      maxTop: Math.max(0, height - viewport), id: 'document'
+    };
+  }
+
+  // 内部阅读小窗口：正文自己带滚动条的老版文章页仍按容器滚动。
+  function articleContainerSurfaces(doc, limit) {
+    var out = [];
+    var nodes;
+    try { nodes = doc.querySelectorAll(ARTICLE_BLOCK_SELECTOR); } catch (e) { return out; }
+    var max = Math.min(nodes.length, 300);
+    for (var i = 0; i < max && out.length < (limit || 3); i++) {
+      var el = nodes[i];
+      if (!el || !visible(el)) continue;
+      var height = articleDimension(el.scrollHeight);
+      var viewport = articleDimension(el.clientHeight);
+      if (!viewport || height <= viewport + 4) continue;
+      var text = '';
+      try { text = String(el.textContent || ''); } catch (e) { continue; }
+      if (text.replace(/\s+/g, '').length < 60) continue;
+      out.push({
+        doc: doc, el: el, kind: 'element',
+        className: (typeof el.className === 'string' ? el.className : ''),
+        height: height, viewport: viewport,
+        top: articleDimension(el.scrollTop),
+        maxTop: Math.max(0, height - viewport), id: 'block:' + i
+      });
+    }
+    return out;
+  }
+
+  function articleSurfaceLabel(surface) {
+    if (surface.kind === 'document') return '阅读页 <html> 文档滚动条';
+    var cls = String(surface.className || '').split(/\s+/)[0];
+    return '正文本地滚动容器' + (cls ? '（.' + cls.slice(0, 24) + '）' : '');
+  }
+
+  function articleSurfaceHeight(surface) {
+    if (surface.kind !== 'document') return articleDimension(surface.el && surface.el.scrollHeight);
+    return Math.max(
+      articleDimension(surface.root && surface.root.scrollHeight),
+      articleDimension(surface.de && surface.de.scrollHeight),
+      articleDimension(surface.body && surface.body.scrollHeight)
+    );
+  }
+
+  function articleSurfaceTop(surface) {
+    if (surface.kind !== 'document') return articleDimension(surface.el && surface.el.scrollTop);
+    var top = articleDimension(surface.win && surface.win.pageYOffset);
+    if (!top) {
+      top = Math.max(
+        articleDimension(surface.de && surface.de.scrollTop),
+        articleDimension(surface.body && surface.body.scrollTop)
+      );
+    }
+    return top;
+  }
+
+  function articleSurfaceAtBottom(surface) {
+    return articleSurfaceTop(surface) >= articleDimension(surface.maxTop) - 2;
+  }
+
+  // 一步滚动：win.scrollTo 和 documentElement/body.scrollTop 双保险，再读回真实位置。
+  function articleScrollStep(surface) {
+    var before = articleSurfaceTop(surface);
+    surface.top = before;
+    var ratio = articleDimension(surface.height) > articleDimension(surface.viewport) * 6
+      ? 1.6 : ARTICLE_SCROLL_STEP_RATIO;
+    var step = Math.max(160, Math.round(articleDimension(surface.viewport) * ratio));
+    var target = Math.min(articleDimension(surface.maxTop), before + step);
+    try {
+      if (surface.kind === 'document') {
+        if (surface.win && typeof surface.win.scrollTo === 'function') surface.win.scrollTo(0, target);
+        if (surface.de) surface.de.scrollTop = target;
+        if (surface.body && surface.body !== surface.de) surface.body.scrollTop = target;
+      } else if (surface.el) {
+        surface.el.scrollTop = target;
+      }
+    } catch (e) {}
+    var after = articleSurfaceTop(surface);
+    surface.top = after;
+    surface.height = Math.max(articleDimension(surface.height), articleSurfaceHeight(surface));
+    surface.maxTop = Math.max(0, surface.height - articleDimension(surface.viewport));
+    var maxTop = articleDimension(surface.maxTop);
+    return {
+      before: before, top: after, maxTop: maxTop,
+      moved: after > before + 1,
+      reached: maxTop <= 1 || after >= maxTop - 2
+    };
+  }
+
+  // 已经到底时补发 scroll 事件：阅读页自己的“到底就通知父页面”检查会再跑一遍。
+  function articlePokeScroll(surface) {
+    var win = surface.kind === 'document' ? surface.win : null;
+    if (!win) { try { win = surface.doc && surface.doc.defaultView; } catch (e) { win = null; } }
+    var doc = surface.doc;
+    try {
+      var Ev = (win && win.Event) || Event;
+      if (win && typeof win.dispatchEvent === 'function') win.dispatchEvent(new Ev('scroll'));
+      if (doc && typeof doc.dispatchEvent === 'function') doc.dispatchEvent(new Ev('scroll'));
+    } catch (e) {}
+  }
+
+  function articlePokeIfDue(surface, key) {
+    var now = Date.now();
+    var done = articleScrollState.pokes[key] || { at: 0, count: 0 };
+    if (done.count >= 3 || now - done.at < 3000) return false;
+    done.at = now;
+    done.count++;
+    articleScrollState.pokes[key] = done;
+    articlePokeScroll(surface);
+    return true;
+  }
+
+  // 每个文档选一个滚动面：阅读页只滚 <html>；阅读 frame 先容器后文档；普通页面只滚容器。
+  function articleSurfacesFor(target) {
+    var doc = target.doc;
+    var out = [];
+    if (target.preview) {
+      // 预览页里再滚 div 就是滚错滚动条：分页图片容器自己没有滚动条。
+      var previewSurface = articleDocumentSurface(doc);
+      if (previewSurface) out.push(previewSurface);
+      return out;
+    }
+    if (target.readingFrame) {
+      out = articleContainerSurfaces(doc, 3);
+      if (!articleIsTopDocument(doc)) {
+        var frameSurface = articleDocumentSurface(doc);
+        if (frameSurface) out.push(frameSurface);
+      }
+      return out;
+    }
+    // 顶层课程页上的可滚动 div 是目录树/内容面板，不是文章正文：绝不能滚。
+    try {
+      if (articleIsTopDocument(doc) && doc.querySelector &&
+        (doc.querySelector('#coursetree') || doc.querySelector('#prev_tab') || doc.querySelector('.prev_ul'))) {
+        return out;
+      }
+    } catch (e) {}
+    out = articleContainerSurfaces(doc, 3);
+    if (!articleIsTopDocument(doc)) {
+      var pageSurface = articleDocumentSurface(doc);
+      if (pageSurface) out.push(pageSurface);
+    }
+    return out;
+  }
+
+  function articleTaskFrameDone(frame) {
+    if (!frame) return false;
+    try {
+      if (taskFrameFinished(frame)) return true;
+      if (findArticleCompletionMarker(frame)) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  function articleDocumentTaskFrame(doc) {
+    try {
+      var win = doc && doc.defaultView;
+      return (win && win.frameElement) || null;
+    } catch (e) { return null; }
+  }
+
+  function articleHasReaderFrame(doc, skip) {
+    var frames;
+    try { frames = doc.querySelectorAll('iframe'); } catch (e) { return false; }
+    for (var i = 0; i < frames.length && i < 80; i++) {
+      if (skip && frames[i] === skip) continue;
+      if (!visible(frames[i])) continue;
+      if (isArticleFrameType(taskFrameType(frames[i]))) return true;
+      if (articleFrameLooksLikeReader(frames[i])) return true;
+    }
+    return false;
+  }
+
+  function articleCollectTargets(docs) {
+    var targets = [];
+    function add(doc, force, priority, preview, readingFrame) {
+      if (!doc || !articleDocumentVisible(doc)) return;
+      for (var i = 0; i < targets.length; i++) {
+        if (targets[i].doc === doc) {
+          if (priority < targets[i].priority) targets[i].priority = priority;
+          targets[i].force = targets[i].force || !!force;
+          targets[i].preview = targets[i].preview || !!preview;
+          targets[i].readingFrame = targets[i].readingFrame || !!readingFrame;
+          return;
+        }
+      }
+      targets.push({
+        doc: doc, force: !!force, priority: priority,
+        preview: !!preview, readingFrame: !!readingFrame
+      });
+    }
+
+    // 1) 已经能直接访问的阅读页文档：最优先，滚它自己的 <html>
+    for (var d = 0; d < docs.length; d++) {
+      if (!articleIsPreviewDocument(docs[d])) continue;
+      var previewFrame = articleDocumentTaskFrame(docs[d]);
+      if (previewFrame && articleTaskFrameDone(previewFrame)) continue;   // 这篇已完成，跳过
+      add(docs[d], false, 0, true, false);
+    }
+    // 2) 文章任务 iframe（同源能读到内容的嵌套阅读页）
+    for (var d2 = 0; d2 < docs.length; d2++) {
+      var frames;
+      try { frames = docs[d2].querySelectorAll('iframe'); } catch (e) { continue; }
+      for (var f = 0; f < frames.length && f < 80; f++) {
+        var frame = frames[f];
+        if (!visible(frame)) continue;
+        var type = taskFrameType(frame);
+        if (type && !isArticleFrameType(type)) continue;
+        var frameDoc = articleFrameDocument(frame);
+        var preview = frameDoc ? articleIsPreviewDocument(frameDoc) : false;
+        if (!preview && !isArticleFrameType(type) && !articleFrameLooksLikeReader(frame)) continue;
+        if (!frameDoc) continue;
+        if (articleTaskFrameDone(frame)) continue;   // 这篇已经完成：跳过，不再滚
+        if (preview) add(frameDoc, true, 0, true, false);
+        else if (isArticleFrameType(type) && !articleHasReaderFrame(frameDoc, frame)) {
+          add(frameDoc, true, 1, false, true);
+        }
+      }
+    }
+    // 3) 普通长正文页面；顶层课程页只是外壳，正文在阅读 iframe 里，不参与滚动
+    for (var d3 = 0; d3 < docs.length; d3++) {
+      if (articleHasModuleFrames(docs[d3]) || articleHasReaderFrame(docs[d3])) continue;
+      add(docs[d3], false, 2, articleIsPreviewDocument(docs[d3]), false);
+    }
+    targets.sort(function (a, b) { return a.priority - b.priority; });
+    return targets;
+  }
+
+  function articleContainerHasOtherTaskFrame(node, frame) {
+    var frames;
+    try { frames = node.querySelectorAll('iframe'); } catch (e) { return false; }
+    for (var i = 0; i < frames.length && i < 40; i++) {
+      if (frames[i] === frame) continue;
+      if (taskFrameType(frames[i])) return true;
+      if (articleFrameLooksLikeReader(frames[i])) return true;
+    }
+    return false;
+  }
+
+  // 完成标记必须和这篇文章在同一个任务容器里，别拿同节视频/测验的“任务点已完成”误跳。
+  function findArticleCompletionMarker(frame) {
+    var node = frame, depth = 0;
+    while (node && depth < 6) {
+      try {
+        if (hasJobFinishedClass(node)) return node;
+        if (articleContainerHasOtherTaskFrame(node, frame)) break;
+        var hits = node.querySelectorAll('.ans-job-finished,.ans-jobfinished,span,div,p,em,i,b');
+        for (var i = 0; i < hits.length && i < 120; i++) {
+          if (hasJobFinishedClass(hits[i])) return hits[i];
+          if (visible(hits[i]) && tightText(hits[i]) === '任务点已完成') return hits[i];
+        }
+      } catch (e) { break; }
+      try { node = node.parentElement; } catch (e) { break; }
+      depth++;
+    }
+    return null;
+  }
+
+  function findExactArticleCompletionMarker(doc) {
+    var markers;
+    try { markers = doc.querySelectorAll(ARTICLE_MARKER_SELECTOR); } catch (e) { return null; }
+    for (var i = 0; i < markers.length; i++) {
+      if (visible(markers[i]) && tightText(markers[i]) === '任务点已完成') return markers[i];
+    }
+    return null;
+  }
+
+  // 全局兜底用的标记：容器里必须有文章/阅读 iframe；正文直接写在页面里时才认长正文。
+  function articleMarkerNearArticleFrame(marker) {
+    var node = marker, depth = 0, sawFrame = false, sawVideo = false;
+    while (node && depth < 8) {
+      var frames;
+      try { frames = node.querySelectorAll('iframe'); } catch (e) { frames = []; }
+      for (var i = 0; i < frames.length && i < 40; i++) {
+        sawFrame = true;
+        if (isArticleFrameType(taskFrameType(frames[i]))) return true;
+        var frameDoc = articleFrameDocument(frames[i]);
+        if (frameDoc && articleIsPreviewDocument(frameDoc)) return true;
+        if (articleFrameLooksLikeReader(frames[i])) return true;
+      }
+      try { if (node.querySelectorAll('video,audio').length) sawVideo = true; } catch (e) {}
+      // 页面里已经有别的任务 iframe / 视频时，不能光凭一段长正文就认定“这是文章任务”。
+      if (!sawFrame && !sawVideo) {
+        try {
+          var blocks = node.querySelectorAll(ARTICLE_SEMANTIC_SELECTOR);
+          for (var b = 0; b < blocks.length && b < 40; b++) {
+            if (blocks[b] === marker || !visible(blocks[b])) continue;
+            if (tightText(blocks[b]).length >= 80) return true;
+          }
+        } catch (e) {}
+      }
+      try { node = node.parentElement; } catch (e) { break; }
+      depth++;
+    }
+    return false;
+  }
+
+  function findCompletedArticleTask(docs) {
+    var articleTasks = [];
+    var articleFrames = [];
+    var pendingOtherTask = false;
+    for (var d = 0; d < docs.length; d++) {
+      var frames;
+      try { frames = docs[d].querySelectorAll('iframe'); } catch (e) { continue; }
+      for (var i = 0; i < frames.length; i++) {
+        var frame = frames[i];
+        if (!visible(frame)) continue;
+        var type = taskFrameType(frame);
+        var frameDoc = articleFrameDocument(frame);
+        var preview = frameDoc ? articleIsPreviewDocument(frameDoc) : false;
+        if (!type && !preview && !articleFrameLooksLikeReader(frame)) continue;
+        var articleLike = (type && isArticleFrameType(type)) || preview;
+        if (!articleLike) {
+          if (!taskFrameFinished(frame)) pendingOtherTask = true;
+          continue;
+        }
+        var src = '';
+        try { src = frame.getAttribute('src') || frame.src || ''; } catch (e) {}
+        articleTasks.push({
+          done: taskFrameFinished(frame) || !!findArticleCompletionMarker(frame),
+          src: src
+        });
+        articleFrames.push(frame);
+      }
+    }
+    // 页面上还有“任务点未完成”的图标：本节还有别的任务点没做完
+    for (var pd = 0; pd < docs.length && !pendingOtherTask; pd++) {
+      var iconList;
+      try { iconList = docs[pd].querySelectorAll('[class*="ans-job-icon"]'); } catch (e) { continue; }
+      for (var pi = 0; pi < iconList.length && pi < 200; pi++) {
+        var iconEl = iconList[pi];
+        if (!visible(iconEl)) continue;
+        var iconLabel = '';
+        try { iconLabel = String(iconEl.getAttribute('aria-label') || ''); } catch (e) {}
+        if (iconLabel.indexOf('任务点') < 0) continue;
+        if (iconLabel.indexOf('未完成') >= 0) { pendingOtherTask = true; break; }
+      }
+    }
+    if (pendingOtherTask) return null;
+
+    var hasReadableArticle = articleTasks.length > 0;
+    if (!hasReadableArticle) {
+      for (var r = 0; r < docs.length; r++) {
+        if (articleDocumentIsReadable(docs[r], false)) { hasReadableArticle = true; break; }
+      }
+    }
+    if (!hasReadableArticle) return null;
+
+    // 任意一篇可见文章任务被平台标记完成，就按“本节文章任务已完成”处理：
+    // 多子节点的文章节点只要求第一个子节点完成，整节就完成。绝不能因此切到第二个子节点——
+    // 切过去后平台不再显示“任务点已完成”，脚本会卡在那里。
+    for (var a = 0; a < articleTasks.length; a++) {
+      if (!articleTasks[a].done) continue;
+      return { key: 'node:' + currentActiveId() + '|' + articleTasks[a].src.slice(0, 200), source: 'node' };
+    }
+    if (articleTasks.length) return null;
+    // 阅读页直接嵌在文档里（没有可识别的任务 iframe）：只认和文章 iframe 同容器的完成标记
+    for (var d2 = 0; d2 < docs.length; d2++) {
+      var hit = findExactArticleCompletionMarker(docs[d2]);
+      if (hit && articleMarkerNearArticleFrame(hit)) {
+        return { key: 'node:' + articleDocumentKey(docs[d2]), source: 'node' };
+      }
+    }
+    return null;
+  }
+
+  var completedArticleState = { key: '', at: 0 };
+  function advanceCompletedArticle(result) {
+    var now = Date.now();
+    if (completedArticleState.key === result.key && now - completedArticleState.at < 7000) return true;
+    completedArticleState.key = result.key;
+    completedArticleState.at = now;
+    log('文章阅读任务已完成（多子节点文章只看第一个），进入下一节');
+    if (!IS_TOP) { notifyTop('articleDone'); return true; }
+    // 文章节点按“第一个子节点完成 = 整节完成”处理：直接下一节，绝不切到第二个子节点。
+    if (isLastSection()) { stopCourseAtEnd(); return true; }
+    if (tryNextSection()) {
+      advanceCooldown = 2;
+      lastActiveId = '';
+      return true;
+    }
+    log('⚠️ 文章阅读已完成，但没找到下一节入口，请手动点一下下一节');
+    return true;
+  }
+
+  var articleScrollState = {
+    section: '', items: {}, pokes: {}, lastAt: 0, fails: {}, lastBottom: null,
+    loggedKey: '', activeKey: '', warnedKey: '', steps: 0, warned: false
+  };
+  function resetArticleScrollProgress() {
+    articleScrollState.items = {};
+    articleScrollState.pokes = {};
+    articleScrollState.fails = {};
+    articleScrollState.lastAt = 0;
+    articleScrollState.lastBottom = null;
+    articleScrollState.loggedKey = '';
+    articleScrollState.activeKey = '';
+    articleScrollState.warnedKey = '';
+    articleScrollState.steps = 0;
+    articleScrollState.warned = false;
+  }
+
+  // 刚把一篇滚到底：先给平台/目录几秒刷新时间，别急着滚同一节的下一篇。
+  function articleWaitingForCompletion() {
+    var w = articleScrollState.lastBottom;
+    if (!w) return null;
+    return (Date.now() - w.at < ARTICLE_SETTLE_MS) ? w : null;
+  }
+
+  // 对一个滚动面最多推进几屏；滚到底只负责触发平台上报，是否完成由调用方判断。
+  function articleDriveSurface(surface, key) {
+    var steps = 0, moved = false, reached = false, last = null;
+    while (steps < ARTICLE_SCROLL_STEPS_PER_TICK && articleScrollState.steps < ARTICLE_SCROLL_MAX_STEPS) {
+      steps++;
+      articleScrollState.steps++;
+      last = articleScrollStep(surface);
+      if (last.moved) moved = true;
+      if (last.reached) { reached = true; break; }
+      if (!last.moved) break;
+    }
+    if (!last) return { moved: false, reached: false };
+    articleScrollState.lastAt = Date.now();
+
+    if (reached) {
+      articleScrollState.items[key] = surface.height;
+      var logKey = key + '|' + Math.round(surface.height);
+      if (articleScrollState.loggedKey !== logKey) {
+        articleScrollState.loggedKey = logKey;
+        log('文章阅读：已把' + articleSurfaceLabel(surface) + '滚动到底部（' +
+          Math.round(last.top) + '/' + Math.round(last.maxTop) + 'px），滚动后检测是否已完成');
+      }
+      // 位置已经到底：补发一次 scroll，让阅读页自己的“到底”检测再跑一遍。
+      articlePokeScroll(surface);
+    } else if (moved && articleScrollState.activeKey !== key) {
+      articleScrollState.activeKey = key;
+      log('文章阅读：向下滚动' + articleSurfaceLabel(surface) + '（文档 ' +
+        Math.round(surface.height) + 'px / 视口 ' + Math.round(surface.viewport) + 'px）');
+    }
+    return { moved: moved, reached: reached };
+  }
+
+  function handleArticleReading(docs) {
+    var section = currentActiveId();
+    if (!section) {
+      try { section = String(location.href || ''); } catch (e) { section = 'article'; }
+    }
+    if (articleScrollState.section !== section) {
+      articleScrollState.section = section;
+      resetArticleScrollProgress();
+    }
+
+    // 1) 先判断“本节是不是已经完成”：已完成就跳过，绝不把已完成的文章再滚一遍。
+    var doneSection = null;
+    try { doneSection = activeSectionDone(docs); } catch (e) {}
+    if (doneSection) { advanceCompletedSection(doneSection); return true; }
+
+    // 2) 文章任务已被平台标记完成：直接下一节，绝不切到第二个子节点
+    //    （切过去后“任务点已完成”会消失，脚本会卡在第二个子节点上）。
+    var completed = null;
+    try { completed = findCompletedArticleTask(docs); } catch (e) {}
+    if (completed) {
+      resetArticleScrollProgress();
+      advanceCompletedArticle(completed);
+      return true;
+    }
+
+    // 3) 滚动当前子节点的文章。
+    var targets = articleCollectTargets(docs);
+    var readable = [];
+    for (var t = 0; t < targets.length; t++) {
+      if (articleDocumentIsReadable(targets[t].doc, targets[t].force)) readable.push(targets[t]);
+    }
+    if (!readable.length) return false;
+
+    var pending = 0;
+    var progressed = false;
+    var waiting = articleWaitingForCompletion();
+    for (var i = 0; i < readable.length; i++) {
+      var target = readable[i];
+      var docKey = articleDocumentKey(target.doc);
+      var surfaces = articleSurfacesFor(target);
+      for (var s = 0; s < surfaces.length; s++) {
+        var surface = surfaces[s];
+        var key = docKey + '|' + surface.id;
+        if (articleScrollState.items[key] === surface.height && articleSurfaceAtBottom(surface)) {
+          // 已滚到底：高度没变就不再重复滚，只偶尔补一次 scroll 让页面自己复查。
+          articlePokeIfDue(surface, key);
+          continue;
+        }
+        pending++;
+        if (progressed) continue;
+        // 上一篇刚到底：先等平台打标，不要立刻滚同一节的下一篇。
+        if (waiting && waiting.docKey !== docKey) continue;
+        var outcome = articleDriveSurface(surface, key);
+        if (outcome && outcome.moved) progressed = true;
+        if (outcome && outcome.reached) {
+          articleScrollState.lastBottom = { docKey: docKey, at: Date.now() };
+          var doneNow = null;
+          try { doneNow = activeSectionDone(docs); } catch (e) {}
+          if (doneNow) { advanceCompletedSection(doneNow); return true; }
+        }
+        if (outcome && !outcome.moved && !outcome.reached) {
+          articleScrollState.fails[key] = (articleScrollState.fails[key] || 0) + 1;
+          if (articleScrollState.fails[key] === 2 && articleScrollState.warnedKey !== key) {
+            articleScrollState.warnedKey = key;
+            log('⚠️ 文章阅读：找到了滚动面但滚不动（' + articleSurfaceLabel(surface) +
+              '），页面可能禁用了滚动；请运行 articleProbe() 把输出发给作者');
+          }
+        }
+      }
+    }
+
+    // 4) 本页文章都已滚到底、整节却仍未完成：等 8 秒再切下一个子节点（多数课程此时整节已完成）。
+    if (!progressed && !pending && IS_TOP && articleScrollState.lastAt) {
+      var waited = Date.now() - articleScrollState.lastAt;
+      if (waited >= ARTICLE_CARD_WAIT_MS && tryNextCard()) {
+        resetArticleScrollProgress();
+        advanceCooldown = 2;
+        lastActiveId = '';
+        return true;
+      }
+      if (waited >= 15000 && !articleScrollState.warned) {
+        articleScrollState.warned = true;
+        log('⚠️ 文章已滚动到底，但平台还没显示“任务点已完成”；继续等待，不提前跳节');
+      }
+    }
+    return true;
+  }
   var videoCompletionWaitKey = '';
   function autoAdvance(docs, completedVideo) {
     if (advanceCooldown > 0) { advanceCooldown--; return; }
+
+    // 优先判断“这一节是不是已经完成”：目录里已有完成标记就跳过，别再滚文章/等标记。
+    var doneSection = null;
+    try { doneSection = activeSectionDone(docs); } catch (e) {}
+    if (doneSection) { advanceCompletedSection(doneSection); return; }
 
     var alreadyWatched = completedVideo || findCompletedVideoTask(docs);
     if (alreadyWatched) {
@@ -23423,7 +24241,12 @@ const CX_FONT_TABLE = Object.freeze({
     }
 
     var vids = collectVideos(docs).filter(function (v) { return !videoInFinishedTask(v); });
-    if (!vids.length) { videoCompletionWaitKey = ''; handleEmptySection(docs); return; }
+    if (!vids.length) {
+      videoCompletionWaitKey = '';
+      if (handleEmptySection(docs)) return;
+      handleArticleReading(docs);
+      return;
+    }
     var anyPlaying = vids.some(function (v) { return !v.paused && !videoFinished(v); });
     if (anyPlaying || !vids.some(videoFinished)) { videoCompletionWaitKey = ''; return; }
 
@@ -23464,8 +24287,9 @@ const CX_FONT_TABLE = Object.freeze({
       try { window.top.location.reload(); } catch (e) {}
       return;
     }
-    if (d.__autoStudy !== 'videoDone' && d.__autoStudy !== 'quizDone') return;
-    log('全自动：收到播放器 iframe 通知（' + d.__autoStudy + '），前往下一节');
+    if (d.__autoStudy !== 'videoDone' && d.__autoStudy !== 'quizDone' && d.__autoStudy !== 'articleDone') return;
+    if (d.__autoStudy === 'articleDone') log('全自动：收到文章阅读 iframe 通知，前往下一节');
+    else log('全自动：收到播放器 iframe 通知（' + d.__autoStudy + '），前往下一节');
     var moved = false;
     try { moved = tryNextCard() || tryNextSection(); } catch (e) {}
     if (!moved && !isLastSection()) log('全自动：没找到下一节入口，请手动检查一下目录');
@@ -25109,6 +25933,44 @@ const CX_FONT_TABLE = Object.freeze({
   window.aiOff = function () {
     AI.enabled = false;
     log('AI 答题已关闭，弹题改为逐项尝试');
+  };
+
+  // 诊断用：文章阅读页有哪些滚动面、脚本准备滚哪一个（文章不滚动时先跑这个）
+  window.articleProbe = function () {
+    var docs = allDocs();
+    var targets = articleCollectTargets(docs);
+    var leaf = null, marker = null, state = null;
+    try { leaf = activeSectionLeaf(); } catch (e) {}
+    try { marker = leaf ? sectionNodeDone(leaf) : null; } catch (e) {}
+    try { state = readSectionTaskState(docs); } catch (e) {}
+    log('文章诊断：当前小节 ' + (leaf ? (leaf.id + ' ' + tightText(leaf).slice(0, 30)) : '(未定位)') +
+      ' | 目录完成标记 ' + (marker ? '有' : '无') +
+      ' | 任务点图标 已完成 ' + (state ? state.icons.done : 0) + '/' + (state ? state.icons.found : 0) +
+      (state && state.counter ? (' | 已完成任务点 ' + state.counter.done + '/' + state.counter.total) : ''));
+    log('文章诊断：可访问 document ' + docs.length + ' 个，候选滚动文档 ' + targets.length + ' 个');
+    for (var i = 0; i < targets.length && i < 8; i++) {
+      var target = targets[i];
+      var readable = false;
+      try { readable = articleDocumentIsReadable(target.doc, target.force); } catch (e) {}
+      var href = '';
+      try { href = String(target.doc.defaultView.location.href || ''); } catch (e) {}
+      log('  #' + (i + 1) + (target.preview ? '[阅读页]' : target.readingFrame ? '[阅读frame]' : '') +
+        (readable ? '' : '[不可读]') + ' ' + href.slice(0, 100));
+      if (!readable) continue;
+      var surfaces = [];
+      try { surfaces = articleSurfacesFor(target); } catch (e) {}
+      if (!surfaces.length) { log('     滚动面：无（这个文档不会被滚动）'); continue; }
+      for (var s = 0; s < surfaces.length; s++) {
+        var surface = surfaces[s];
+        log('     滚动面 #' + (s + 1) + '：' + articleSurfaceLabel(surface) + ' 当前位置 ' +
+          Math.round(articleSurfaceTop(surface)) + '/' + Math.round(surface.maxTop) + 'px（内容高 ' +
+          Math.round(surface.height) + '，视口 ' + Math.round(surface.viewport) + '）');
+      }
+    }
+    if (!targets.length) {
+      log('  ⚠️ 没找到文章阅读页：文章若在跨域 iframe 里，请确认油猴脚本也注入到了那个 iframe');
+    }
+    return targets.length;
   };
 
   // 诊断用：一眼看清“脚本有没有跑、有没有看到视频/弹题、有没有跨域 iframe”
